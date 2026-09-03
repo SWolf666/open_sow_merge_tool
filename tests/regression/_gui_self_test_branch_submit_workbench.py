@@ -40,7 +40,15 @@ def _create_fixture():
             """
         )
         for index in range(32):
-            name = "develop" if index == 0 else "master" if index == 1 else f"feature_{index:02d}"
+            name = (
+                "develop"
+                if index == 0
+                else "master"
+                if index == 1
+                else "feature_超长中文分支_配置同步_2026_第三季度_策划验收"
+                if index == 2
+                else f"feature_{index:02d}"
+            )
             folder = os.path.join(root, name)
             os.makedirs(folder)
             open(os.path.join(folder, "seed.xlsx"), "wb").close()
@@ -57,6 +65,9 @@ def main():
     fixture = _create_fixture()
     root = tk.Tk()
     root.withdraw()
+    # Construct this Native surface under the Windows high-DPI scaling used by
+    # the installation smoke test, then exercise the lower scale variants.
+    root.tk.call("tk", "scaling", 2.666)
     items = [
         bs.SvnChangeItem(
             path=os.path.join(fixture, "develop", f"配置_{index:03d}.xlsx"),
@@ -86,6 +97,21 @@ def main():
             assert app.preflight_button.instate(["disabled"]), "without targets, multi-branch preflight is not applicable"
             assert app.submit_button.instate(["!disabled"]), "without targets, native single-branch submit must be available"
             assert app.submit_button.cget("text") == "SVN 单分支提交"
+            for scale in (1.0, 1.25, 1.5, 2.0):
+                root.tk.call("tk", "scaling", scale)
+                for width, height in ((900, 620), (1366, 768), (1920, 1080)):
+                    root.state("normal")
+                    root.geometry(f"{width}x{height}+40+40")
+                    root.update_idletasks()
+                    root.update()
+                    root_bottom = root.winfo_rooty() + root.winfo_height()
+                    for button in (app.preflight_button, app.submit_button):
+                        assert button.winfo_ismapped()
+                        assert button.winfo_rooty() + button.winfo_height() <= root_bottom
+            root.tk.call("tk", "scaling", 1.0)
+            root.geometry("1120x760+40+40")
+            root.update_idletasks()
+            root.update()
             direct_calls = []
             app.engine._tortoise = lambda command, paths, **kwargs: direct_calls.append((command, list(paths), kwargs)) or 0
             app._submit_single_branch()
@@ -110,6 +136,54 @@ def main():
                     f"outer_y={app.footer_host.master.winfo_rooty()} outer_h={app.footer_host.master.winfo_height()} "
                     f"outer_req={app.footer_host.master.winfo_reqheight()}"
                 )
+            long_name = next(
+                name for name in app.target_vars if "超长中文分支" in name
+            )
+            long_iid = next(
+                iid for iid, name in app._target_rows.items() if name == long_name
+            )
+            assert app.target_xscrollbar.winfo_ismapped(), "目标分支横向滚动条不可见"
+            app.target_tree.see(long_iid)
+            root.update_idletasks()
+            app.target_tree.xview_moveto(1.0)
+            assert app.target_tree.xview()[0] > 0, "长分支名无法横向浏览"
+            long_bbox = app.target_tree.bbox(long_iid)
+            assert long_bbox, "长分支名行未渲染"
+
+            class HoverEvent:
+                x = 12
+                y = long_bbox[1] + max(1, long_bbox[3] // 2)
+                x_root = 80
+                y_root = 120
+
+            app._target_tree_hover(HoverEvent())
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline and app._branch_tooltip is None:
+                root.update()
+                time.sleep(0.02)
+            assert app._branch_tooltip is not None, "长分支名悬停全文提示未出现"
+            tooltip_labels = [
+                child
+                for child in app._branch_tooltip.winfo_children()
+                if child.winfo_class() == "Label"
+            ]
+            assert tooltip_labels and long_name in tooltip_labels[0].cget("text")
+            app._copy_to_clipboard(long_name)
+            assert root.clipboard_get() == long_name
+            app._hide_branch_tooltip()
+            long_scope = os.path.join(
+                fixture,
+                "develop",
+                "配置表_中文路径_第一季度_最终验收_含有很长目录名",
+            )
+            app.scope_var.set(long_scope)
+            root.update_idletasks()
+            assert app.scope_scrollbar.winfo_ismapped(), "扫描路径横向滚动条不可见"
+            app.scope_entry.xview_moveto(1.0)
+            assert app.scope_entry.xview()[0] > 0, "中文扫描路径无法横向浏览"
+            app._copy_to_clipboard(long_scope)
+            assert root.clipboard_get() == long_scope
+            app.scope_var.set(context.scope_path)
             target_name = next(name for name in app.target_vars if name != "master")
             app.target_vars[target_name].set(True)
             app._target_selection[target_name] = True

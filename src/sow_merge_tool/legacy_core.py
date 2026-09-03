@@ -33986,6 +33986,177 @@ class SowMergeApp:
             return self.save_a_inplace()
         return self.save_b_inplace()
 
+    def _schedule_command_bar_layout(self, _event=None):
+        """Coalesce command-bar reflow while the main window is resized."""
+        top = getattr(self, "_command_bar_top", None)
+        if top is None:
+            return
+        pending = getattr(self, "_command_bar_layout_after_id", None)
+        if pending is not None:
+            try:
+                top.after_cancel(pending)
+            except tk.TclError as exc:
+                _dlog(f"command bar layout timer cancel skipped: {exc}")
+        try:
+            self._command_bar_layout_after_id = top.after_idle(
+                self._layout_command_bar
+            )
+        except (tk.TclError, RuntimeError) as exc:
+            _dlog(f"command bar layout scheduling skipped: {exc}")
+            self._command_bar_layout_after_id = None
+
+    def _layout_command_bar(self):
+        """Keep every core command inside the client area at narrow widths.
+
+        The wide layout remains a single compact row.  Below the wide-layout
+        threshold the title gets a full row and command groups wrap into a
+        second/third row using their measured request widths; this avoids
+        placing output actions just beyond the right edge of a 900px window.
+        """
+        self._command_bar_layout_after_id = None
+        top = getattr(self, "_command_bar_top", None)
+        heading = getattr(self, "_command_bar_heading", None)
+        actions = getattr(self, "_command_bar_actions", None)
+        items = tuple(getattr(self, "_command_bar_items", ()) or ())
+        if top is None or heading is None or actions is None or not items:
+            return
+        try:
+            top.update_idletasks()
+            width = int(top.winfo_width() or self.root.winfo_width() or 0)
+        except (tk.TclError, TypeError, ValueError) as exc:
+            _dlog(f"command bar width unavailable: {exc}")
+            return
+        try:
+            heading_requested = max(1, int(heading.winfo_reqwidth()))
+            actions_requested = max(1, int(actions.winfo_reqwidth()))
+        except (tk.TclError, TypeError, ValueError) as exc:
+            _dlog(f"command bar request width unavailable: {exc}")
+            heading_requested = 360
+            actions_requested = 1180
+        # Use the single-row arrangement only when the title and all command
+        # groups can actually fit together.  A fixed breakpoint alone leaves
+        # the output group outside a 1366px client area when the localized
+        # title's natural width grows.
+        narrow = width < heading_requested + actions_requested + 26
+        try:
+            for item in items:
+                item.grid_remove()
+                item.place_forget()
+        except tk.TclError as exc:
+            _dlog(f"command bar item hide skipped: {exc}")
+
+        # ``actions`` is an explicit overflow container.  Its children use
+        # pixel placement below rather than one shared Tk Grid: Grid columns
+        # are global to every row, so a wide item in row 1 can silently push a
+        # row-2 item beyond the right edge at high DPI.
+        try:
+            actions.grid_propagate(False)
+        except tk.TclError as exc:
+            _dlog(f"command bar propagation setup skipped: {exc}")
+        secondary_items = tuple(
+            getattr(self, "_command_bar_secondary_items", ()) or ()
+        )
+        try:
+            tk_scaling = float(self.root.tk.call("tk", "scaling"))
+        except (tk.TclError, TypeError, ValueError) as exc:
+            _dlog(f"command bar scaling unavailable: {exc}")
+            tk_scaling = 1.0
+        layout_items = tuple(
+            item for item in items
+            if not (
+                narrow
+                and width < 1080
+                and tk_scaling >= 1.9
+                and item in secondary_items
+            )
+        )
+        for item in secondary_items:
+            if item not in items:
+                continue
+            try:
+                item.grid_remove()
+                item.place_forget()
+            except tk.TclError as exc:
+                _dlog(f"secondary command hide skipped: {exc}")
+
+        if not narrow:
+            top.grid_columnconfigure(0, weight=1)
+            top.grid_columnconfigure(1, weight=0)
+            heading.grid_configure(
+                row=0, column=0, columnspan=1, sticky="w", padx=0, pady=0
+            )
+            actions.grid_configure(
+                row=0, column=1, columnspan=1, sticky="e", padx=(18, 0), pady=0
+            )
+            x = 0
+            row_height = 0
+            for item in layout_items:
+                try:
+                    requested = max(1, int(item.winfo_reqwidth()))
+                    row_height = max(row_height, int(item.winfo_reqheight()))
+                except (tk.TclError, TypeError, ValueError) as exc:
+                    _dlog(f"wide command size fallback: {exc}")
+                    requested = 120
+                    row_height = max(row_height, 32)
+                gap = 4 if x else 0
+                item.place(x=x + gap, y=0, anchor="nw")
+                x += gap + requested
+            try:
+                actions.configure(width=max(1, x), height=max(1, row_height))
+            except tk.TclError as exc:
+                _dlog(f"wide command bar size update skipped: {exc}")
+            return
+
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_columnconfigure(1, weight=0)
+        heading.grid_configure(
+            row=0, column=0, columnspan=2, sticky="ew", padx=0, pady=(0, 3)
+        )
+        actions.grid_configure(
+            row=1, column=0, columnspan=2, sticky="ew", padx=0, pady=0
+        )
+        try:
+            actions.update_idletasks()
+            available = int(actions.winfo_width() or width)
+        except (tk.TclError, TypeError, ValueError) as exc:
+            _dlog(f"narrow command bar width unavailable: {exc}")
+            available = width
+        available = max(1, available)
+        row = 0
+        row_width = 0
+        row_height = 0
+        column = 0
+        row_heights: list[int] = []
+        for item in layout_items:
+            try:
+                requested = max(1, int(item.winfo_reqwidth()))
+                requested_height = max(1, int(item.winfo_reqheight()))
+            except (tk.TclError, TypeError, ValueError) as exc:
+                _dlog(f"narrow command size fallback: {exc}")
+                requested = 120
+                requested_height = 32
+            gap = 4 if column else 0
+            if column and row_width + gap + requested > available:
+                row_heights.append(row_height)
+                row += 1
+                row_width = 0
+                row_height = 0
+                column = 0
+                gap = 0
+            y = sum(row_heights) + (2 * row)
+            item.place(x=row_width + gap, y=y, anchor="nw")
+            row_width += gap + requested
+            row_height = max(row_height, requested_height)
+            column += 1
+        row_heights.append(row_height)
+        try:
+            actions.configure(
+                width=available,
+                height=max(1, sum(row_heights) + 2 * max(0, len(row_heights) - 1)),
+            )
+        except tk.TclError as exc:
+            _dlog(f"narrow command bar size update skipped: {exc}")
+
     def _build_ui(self):
         tk.Frame(self.root, height=4, bg=self.workspace_chrome_color, bd=0, highlightthickness=0).pack(fill="x")
         top = ttk.Frame(self.root, style="MergeChrome.TFrame")
@@ -34016,7 +34187,6 @@ class SowMergeApp:
         self.command_group_labels = []
         def _command_group(title: str):
             group = ttk.LabelFrame(actions, text=title, padding=(4, 1), style="Workspace.Status.TFrame")
-            group.pack(side="left", padx=(4, 0))
             self.command_group_labels.append(group)
             return group
         compare_group = _command_group("比较")
@@ -34063,12 +34233,36 @@ class SowMergeApp:
         self.top_save_as_btn = ttk.Button(output_group, text="另存为", command=self._save_as_result); self.top_save_as_btn.pack(side="left", padx=(4, 0))
         self.update_btn = None
         self.more_menu = tk.Menubutton(actions, text="更多…", relief="flat", padx=8)
-        self.more_menu.pack(side="left")
         self.more_menu_model = tk.Menu(self.more_menu, tearoff=False)
+        self.more_menu_model.add_command(label="重算并刷新", command=lambda: self.recalc_and_refresh())
+        self.more_menu_model.add_command(label="比较设置", command=lambda: self._show_compare_settings())
+        self.more_menu_model.add_separator()
         self.more_menu_model.add_command(label="导出诊断包", command=self.export_diagnostic_bundle)
         self.more_menu_model.add_command(label="复制反馈信息", command=self.copy_feedback_info)
         self.more_menu_model.add_command(label="检查更新", command=self._do_svn_update)
         self.more_menu.configure(menu=self.more_menu_model)
+        # The group widgets are laid out by one responsive grid.  Keeping the
+        # overflow menu in the same measured item list makes it reachable at
+        # 900px instead of allowing it to fall outside the right edge.
+        self._command_bar_top = top
+        self._command_bar_heading = heading
+        self._command_bar_actions = actions
+        self._command_bar_items = (
+            compare_group,
+            navigation_group,
+            process_group,
+            output_group,
+            self.more_menu,
+        )
+        # At a very narrow/high-DPI client the compare utilities are secondary
+        # actions.  Keep them available in "更多" so the navigation, explicit
+        # merge direction, save and undo commands can remain on the visible
+        # command surface without forcing the title or output off-screen.
+        self._command_bar_secondary_items = (compare_group,)
+        self._command_bar_layout_after_id = None
+        top.bind("<Configure>", self._schedule_command_bar_layout, add="+")
+        actions.bind("<Configure>", self._schedule_command_bar_layout, add="+")
+        self._schedule_command_bar_layout()
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 2))
 

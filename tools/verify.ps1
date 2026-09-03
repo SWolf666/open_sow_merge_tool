@@ -19,6 +19,9 @@ if ($LASTEXITCODE -ne 0) { throw "Test profile $Profile failed." }
 
 & $python -m ruff check src\sow_merge_tool\cli.py src\sow_merge_tool\__main__.py tests\unit
 if ($LASTEXITCODE -ne 0) { throw 'Ruff gate failed.' }
+$ruffBase = (git rev-parse 'HEAD^').Trim()
+& $python (Join-Path $repo 'tools\ruff_changed.py') --base $ruffBase
+if ($LASTEXITCODE -ne 0) { throw 'Changed-lines Ruff gate failed.' }
 
 & (Join-Path $repo 'tools\build.ps1') -Clean
 if ($LASTEXITCODE -ne 0) { throw 'Build gate failed.' }

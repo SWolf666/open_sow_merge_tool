@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -36,7 +37,9 @@ from .svn_status_provider import (
     records_by_path,
     scan_status,
 )
-from .ui_foundation import THEME, UiTaskRunner, CommandState, configure_ttk_style
+from .ui_foundation import THEME, CommandState, UiTaskRunner, configure_ttk_style
+
+_LOG = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = (".xlsx",)
 DEFAULT_BRANCHES = ("develop", "release", "sandbox")
@@ -2054,6 +2057,8 @@ class BranchSubmitWorkbench:
         self.work_mode_var = tk.StringVar(value="源分支单提交")
         self.step_text_var = tk.StringVar(value="① 选择内容   ② SVN 单分支提交")
         self._keyboard_search_entry = None
+        self._branch_tooltip = None
+        self._branch_tooltip_after = None
         self._build_style()
         self._build_ui()
         self._refresh_source_metadata()
@@ -2137,12 +2142,31 @@ class BranchSubmitWorkbench:
         sources = [item.name for item in self.candidates if item.enabled]
         self.source_box = ttk.Combobox(info, textvariable=self.source_var, values=sources, state="readonly", width=22)
         self.source_box.grid(row=0, column=1, sticky="w", padx=(8, 24)); self.source_box.bind("<<ComboboxSelected>>", self._source_changed)
+        self.source_box.bind(
+            "<Enter>",
+            lambda event: self._schedule_branch_tooltip(
+                self.source_var.get(), event.x_root, event.y_root
+            ),
+        )
+        self.source_box.bind("<Leave>", lambda _event: self._hide_branch_tooltip())
         ttk.Label(info, text="提交到").grid(row=0, column=2, sticky="w")
         self.repo_url_label = ttk.Label(info, textvariable=self.repo_url_var, foreground=THEME.accent, cursor="hand2")
         self.repo_url_label.grid(row=0, column=3, sticky="w", padx=(8, 0))
         self.repo_url_label.bind("<Button-1>", self._open_repository_url)
         ttk.Label(info, text="扫描范围").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(info, textvariable=self.scope_var, state="readonly").grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.scope_entry = ttk.Entry(info, textvariable=self.scope_var, state="readonly")
+        self.scope_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.scope_scrollbar = ttk.Scrollbar(info, orient="horizontal", command=self.scope_entry.xview)
+        self.scope_scrollbar.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(2, 0))
+        self.scope_entry.configure(xscrollcommand=self.scope_scrollbar.set)
+        self.scope_entry.bind(
+            "<Enter>",
+            lambda event: self._schedule_branch_tooltip(
+                self.scope_var.get(), event.x_root, event.y_root
+            ),
+        )
+        self.scope_entry.bind("<Leave>", lambda _event: self._hide_branch_tooltip())
+        self.scope_entry.bind("<Button-3>", self._scope_entry_menu)
         info.columnconfigure(3, weight=1)
 
         paned = ttk.Panedwindow(outer, orient="horizontal"); paned.pack(fill="both", expand=True, pady=(10, 0))
@@ -2173,7 +2197,7 @@ class BranchSubmitWorkbench:
         )
         target_scroll.configure(command=self.target_tree.yview)
         target_xscroll.configure(command=self.target_tree.xview)
-        for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 125), ("state", "处理状态", 90), ("changed", "最近修改", 112)):
+        for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 220), ("state", "处理状态", 90), ("changed", "最近修改", 112)):
             self.target_tree.heading(key, text=title)
             self.target_tree.column(key, width=width, anchor="center" if key in {"check", "favorite"} else "w", stretch=key == "branch")
         self.target_tree.tag_configure("ready", foreground=THEME.success)
@@ -2181,11 +2205,18 @@ class BranchSubmitWorkbench:
         self.target_tree.tag_configure("blocked", foreground=THEME.error)
         self.target_tree.tag_configure("committed", foreground=THEME.success)
         self.target_tree.tag_configure("frozen", foreground=THEME.disabled)
-        self.target_tree.pack(side="left", fill="both", expand=True); target_scroll.pack(side="right", fill="y"); target_xscroll.pack(side="bottom", fill="x")
+        self.target_scrollbar = target_scroll
+        self.target_xscrollbar = target_xscroll
+        canvas_holder.columnconfigure(0, weight=1)
+        canvas_holder.rowconfigure(0, weight=1)
+        self.target_tree.grid(row=0, column=0, sticky="nsew")
+        target_scroll.grid(row=0, column=1, sticky="ns")
+        target_xscroll.grid(row=1, column=0, sticky="ew")
         self.target_tree.bind("<Button-1>", self._target_tree_click)
         self.target_tree.bind("<space>", self._target_space)
         self.target_tree.bind("<Double-1>", self._target_tree_double_click)
         self.target_tree.bind("<Motion>", self._target_tree_hover)
+        self.target_tree.bind("<Leave>", lambda _event: self._hide_branch_tooltip())
         self.target_tree.bind("<Button-3>", self._target_tree_menu)
 
         main = ttk.Frame(paned, style="App.TFrame"); paned.add(main, weight=5)
@@ -2421,12 +2452,97 @@ class BranchSubmitWorkbench:
             self._open_confirmation_dialog(preferred_target=name)
         return "break"
 
+    def _hide_branch_tooltip(self):
+        pending = getattr(self, "_branch_tooltip_after", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except (self.tk.TclError, RuntimeError) as exc:
+                _LOG.debug("branch tooltip timer cancel skipped: %s", exc)
+            self._branch_tooltip_after = None
+        tooltip = getattr(self, "_branch_tooltip", None)
+        if tooltip is not None:
+            try:
+                if tooltip.winfo_exists():
+                    tooltip.destroy()
+            except self.tk.TclError:
+                pass
+        self._branch_tooltip = None
+
+    def _schedule_branch_tooltip(self, text: str, x_root: int, y_root: int):
+        self._hide_branch_tooltip()
+        value = str(text or "").strip()
+        if not value:
+            return
+        try:
+            self._branch_tooltip_after = self.root.after(
+                280,
+                lambda: self._show_branch_tooltip(value, x_root, y_root),
+            )
+        except self.tk.TclError:
+            self._branch_tooltip_after = None
+
+    def _show_branch_tooltip(self, text: str, x_root: int, y_root: int):
+        self._branch_tooltip_after = None
+        if self.closing or not str(text or "").strip():
+            return
+        try:
+            tooltip = self.tk.Toplevel(self.root)
+            tooltip.wm_overrideredirect(True)
+            tooltip.configure(background="#FFFBE6", borderwidth=1, relief="solid")
+            max_width = max(420, min(900, int(self.root.winfo_width()) - 40))
+            label = self.tk.Label(
+                tooltip,
+                text=str(text),
+                justify="left",
+                anchor="w",
+                wraplength=max_width,
+                background="#FFFBE6",
+                foreground=THEME.text,
+                padx=8,
+                pady=5,
+                font=(THEME.font_family, 9),
+            )
+            label.pack()
+            tooltip.update_idletasks()
+            screen_w = int(tooltip.winfo_screenwidth())
+            screen_h = int(tooltip.winfo_screenheight())
+            x = min(max(0, int(x_root) + 12), max(0, screen_w - tooltip.winfo_width() - 8))
+            y = min(max(0, int(y_root) + 18), max(0, screen_h - tooltip.winfo_height() - 8))
+            tooltip.geometry(f"+{x}+{y}")
+            self._branch_tooltip = tooltip
+        except self.tk.TclError:
+            self._branch_tooltip = None
+
+    def _scope_entry_menu(self, event):
+        if self._ui_busy():
+            return "break"
+        value = str(self.scope_var.get() or "")
+        menu = self.tk.Menu(self.root, tearoff=False)
+        menu.add_command(
+            label="复制完整扫描路径",
+            command=lambda text=value: self._copy_to_clipboard(text),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _copy_to_clipboard(self, value: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(value or ""))
+            self.root.update_idletasks()
+        except self.tk.TclError:
+            pass
+
     def _target_tree_hover(self, event):
         iid = self.target_tree.identify_row(event.y)
         name = self._target_rows.get(iid)
         if name:
             self.target_tree.configure(cursor="hand2")
             self.status_var.set(f"目标分支：{name}")
+            self._schedule_branch_tooltip(name, event.x_root, event.y_root)
+        else:
+            self._hide_branch_tooltip()
 
     def _target_tree_menu(self, event):
         if self._ui_busy():
@@ -2437,7 +2553,7 @@ class BranchSubmitWorkbench:
             return "break"
         self.target_tree.selection_set(iid)
         menu = self.tk.Menu(self.root, tearoff=False)
-        menu.add_command(label="复制分支名", command=lambda value=name: (self.root.clipboard_clear(), self.root.clipboard_append(value)))
+        menu.add_command(label="复制分支名", command=lambda value=name: self._copy_to_clipboard(value))
         menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
@@ -3893,6 +4009,7 @@ class BranchSubmitWorkbench:
         if self._confirmation_active:
             self.status_var.set("人工确认正在核对目标状态，请稍候")
             return
+        self._hide_branch_tooltip()
         self.closing = True
         self.scan_cancel.set()
         self.ui_tasks.close()

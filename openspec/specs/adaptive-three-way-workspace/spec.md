@@ -216,3 +216,34 @@ The system SHALL reserve `L<n>` notation for internal diagnostics and use Excel-
 #### Scenario: Structural column is pending or completed
 - **WHEN** a status, tooltip, confirmation, blocker, conflict location, or completion message references a logical column
 - **THEN** the user-facing text SHALL show `A..Z`, `AA..ZZ`, and later Excel-style labels and SHALL NOT show `L1..L100`
+### Requirement: Explicit cache-backed difference browser
+
+The system SHALL expose a default-expanded difference browser built from the existing per-Sheet comparison cache, with no second workbook scan.
+
+#### Scenario: browse and locate a difference
+
+- **WHEN** the user filters or selects a difference row
+- **THEN** the browser shows type/count/status and synchronizes the selected Sheet and real workbook cell
+
+#### Scenario: double-click safety
+
+- **WHEN** the user double-clicks a workbook cell or difference row
+- **THEN** the tool only selects/locates and displays details; it SHALL NOT write workbook content
+
+### Requirement: Unsaved close protection
+
+The system SHALL guard window close when either editable side is dirty.
+
+#### Scenario: save, discard or cancel
+
+- **WHEN** the user closes with unsaved changes
+- **THEN** the tool offers “保存并关闭 / 放弃改动并关闭 / 取消”; a failed save leaves the window and edits intact
+
+### Requirement: Consistent two-way roles
+
+The system SHALL use one role presentation for identity cards, pane titles and direction-labelled actions.
+
+#### Scenario: two-way comparison
+
+- **WHEN** comparing two files without a Base workbook
+- **THEN** the left side is labeled Base and the right side Mine consistently, with no contradictory Theirs label

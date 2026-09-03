@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import argparse
@@ -28,6 +30,7 @@ from urllib.parse import quote
 from dataclasses import dataclass, field
 from enum import Enum
 import sqlite3
+from collections.abc import Iterable, Sequence
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -42,12 +45,20 @@ from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
-from .ui_foundation import THEME, UiTrace, configure_ttk_style
+from .ui_foundation import (
+    THEME,
+    UiTrace,
+    DifferenceItem,
+    DifferenceKind,
+    CommandState,
+    configure_ttk_style,
+)
+from .difference_browser import DifferenceBrowser
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-17.update90"
-APP_BUILD_TAG = "single-branch-native-commit"
+APP_VERSION = "2026-09-03.update91"
+APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -3716,6 +3727,69 @@ def _row_map_from_pairs(pairs: list[tuple[int | None, int | None]]) -> dict[int,
         if left is not None and right is not None:
             out[left] = right
     return out
+
+
+def _augment_three_way_row_pairs_with_base_deletions(
+    display_pairs: list[tuple[int | None, int | None]],
+    mine_to_base: dict[int, int] | None,
+    theirs_to_base: dict[int, int] | None,
+    base_max_row: int | None,
+) -> tuple[list[tuple[int | None, int | None]], dict[int, int | None]]:
+    """Insert logical rows deleted from both Mine and Theirs.
+
+    The normal display alignment is built from Mine/Theirs, so a row that is
+    present only in Base has no pair at all.  That is a meaningful three-way
+    deletion and must remain visible to the difference browser.  Return the
+    updated pairs plus explicit Base-row overrides for the synthetic
+    ``(None, None)`` entries.  Keeping this projection in the cache layer
+    means loaded and not-yet-opened Sheet views expose exactly the same rows.
+
+    ``mine_to_base``/``theirs_to_base`` intentionally contain only confident
+    side-to-Base matches; unknown/independent append rows therefore do not
+    consume a Base identity and are not mistaken for deletions.
+    """
+    pairs = list(display_pairs or ())
+    limit = max(0, int(base_max_row or 0))
+    if not pairs or limit <= 0:
+        return pairs, {}
+    mine_map = mine_to_base or {}
+    theirs_map = theirs_to_base or {}
+    used_base_rows = {
+        int(value)
+        for value in tuple(mine_map.values()) + tuple(theirs_map.values())
+        if value is not None and int(value) > 0
+    }
+    missing = [row for row in range(1, limit + 1) if row not in used_base_rows]
+    if not missing:
+        return pairs, {}
+
+    def pair_base_identity(pair: tuple[int | None, int | None]) -> int | None:
+        left, right = pair
+        if left is not None and left in mine_map:
+            return int(mine_map[left])
+        if right is not None and right in theirs_map:
+            return int(theirs_map[right])
+        return None
+
+    synthetic: dict[int, int | None] = {}
+    # Insert in ascending Base order.  Since every insertion is before a
+    # larger Base identity, the recorded pair index remains correct after
+    # subsequent insertions.
+    for base_row in missing:
+        insert_at = len(pairs)
+        for idx, pair in enumerate(pairs):
+            identity = pair_base_identity(pair)
+            if identity is not None and identity >= base_row:
+                insert_at = idx
+                break
+        pairs.insert(insert_at, (None, None))
+        # Shift all existing synthetic indices at/after the insertion point.
+        synthetic = {
+            (idx + 1 if idx >= insert_at else idx): value
+            for idx, value in synthetic.items()
+        }
+        synthetic[insert_at] = int(base_row)
+    return pairs, synthetic
 
 
 def _reconcile_three_way_row_pairs_by_base(
@@ -10085,6 +10159,72 @@ def merge_side_label(context: MergeLaunchContext | None, side: str, *, candidate
     return merge_role_label(context, role or normalized.lower(), candidate=candidate)
 
 
+@dataclass(frozen=True)
+class RolePresentation:
+    """Single source of truth for pane/path labels and write directions."""
+
+    left: str
+    middle: str
+    right: str
+    left_role: str
+    middle_role: str
+    right_role: str
+
+    def label_for_side(self, side: str) -> str:
+        """Return the visible semantic label for a physical pane side."""
+        normalized = str(side or "").upper()
+        return {
+            "A": self.left,
+            "BASE": self.middle,
+            "B": self.right,
+        }.get(normalized, "")
+
+    def roles_for_direction(self, direction: str) -> tuple[str, str | None]:
+        """Map a copy command to its source/target visible roles."""
+        source_target = {
+            "A2B": ("A", "B"),
+            "B2A": ("B", "A"),
+            "BASE2A": ("BASE", "A"),
+            # MINE2A is a conflict-resolution acknowledgement, not a write.
+            "MINE2A": ("A", None),
+        }
+        source, target = source_target.get(str(direction or "").upper(), ("A", "B"))
+        return self.label_for_side(source), self.label_for_side(target) or None
+
+    def action_label(self, direction: str, scope: str = "row") -> str:
+        """Render a direction-labelled command in the current scenario."""
+        source, target = self.roles_for_direction(direction)
+        suffix = {
+            "region": "区域",
+            "global": "全局",
+            "table": "表",
+            "row": "行",
+            "column": "列",
+        }.get(str(scope or "").lower(), "")
+        if str(direction or "").upper() == "MINE2A":
+            return f"保留 {source}{(' ' + suffix) if suffix else ''}"
+        return f"应用 {source} → {target}{(' ' + suffix) if suffix else ''}"
+
+    @classmethod
+    def for_app(cls, app) -> "RolePresentation":
+        context = getattr(app, "launch_context", None)
+        if getattr(app, "merge_mode", False) and getattr(app, "has_base", False):
+            return cls(
+                merge_role_label(context, "mine"),
+                merge_role_label(context, "base"),
+                merge_role_label(context, "theirs"),
+                "mine", "base", "theirs",
+            )
+        # In ordinary SVN comparison A is the pristine/base side and B is the
+        # working/mine side.  No third card is shown in this mode.
+        return cls(
+            merge_role_label(context, "base"),
+            merge_role_label(context, "base"),
+            merge_role_label(context, "mine"),
+            "base", "base", "mine",
+        )
+
+
 def _create_startup_candidate_copy(source_path: str, role: str) -> str:
     ext = _workbook_ext(source_path)
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{time.time_ns()}"
@@ -12660,6 +12800,7 @@ class SheetView:
         self.app = app
         self.root = getattr(app, "root", None)
         self.sheet = sheet_name
+        self.role_presentation = RolePresentation.for_app(app)
         # Support lazy tab containers: if parent is already a tab frame, reuse it.
         if isinstance(parent, ttk.Frame) and not parent.winfo_children():
             self.frame = parent
@@ -12695,6 +12836,9 @@ class SheetView:
         self.pair_text_a: dict[int, str] = {}
         self.pair_text_b: dict[int, str] = {}
         self.pair_text_base: dict[int, str] = {}
+        self.pair_parts_a: dict[int, tuple[str, ...]] = {}
+        self.pair_parts_b: dict[int, tuple[str, ...]] = {}
+        self.pair_parts_base: dict[int, tuple[str, ...]] = {}
         self.pair_diff_cols: dict[int, set[int]] = {}
         self.pair_base_diff_cols: dict[int, set[int]] = {}
         self.row_a_to_pair_idx: dict[int, int] = {}
@@ -13033,9 +13177,11 @@ class SheetView:
             menu_btn.pack(side="left")
             return group, main_btn, menu_btn
 
+        left_action_text = self._format_direction_action(left_row_dir, "row")
+        right_action_text = self._format_direction_action(right_row_dir, "row")
         self.use_left_group, self.use_left_btn, self.use_left_menu_btn = _build_split_group(
             self.toolbar_action_group,
-            "采用左",
+            left_action_text,
             "#eaf2ff",
             command=lambda: self._run_copy_action_by_mode(self._left_copy_direction),
         )
@@ -13062,7 +13208,7 @@ class SheetView:
 
         self.use_right_group, self.use_right_btn, self.use_right_menu_btn = _build_split_group(
             self.toolbar_action_group,
-            "采用右",
+            right_action_text,
             "#ffecec",
             command=lambda: self._run_copy_action_by_mode(self._right_copy_direction),
         )
@@ -13092,7 +13238,7 @@ class SheetView:
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
             self.use_base_btn = tk.Button(
                 self.toolbar_action_group,
-                text=f"保留{merge_side_label(getattr(self.app, 'launch_context', None), 'A')}",
+                text=self.role_presentation.action_label("MINE2A"),
                 bg="#f3f3ff",
                 padx=10,
                 pady=2,
@@ -13176,7 +13322,7 @@ class SheetView:
         self.column_action_button_group.pack(side="right")
         self.use_theirs_col_btn = tk.Button(
             self.column_action_button_group,
-            text=f"采用{merge_side_label(getattr(self.app, 'launch_context', None), 'B')}列",
+            text=f"应用 {self.role_presentation.right} → {self.role_presentation.left} 列",
             padx=8,
             pady=1,
             state="disabled",
@@ -13184,7 +13330,7 @@ class SheetView:
         )
         self.use_base_col_btn = tk.Button(
             self.column_action_button_group,
-            text=f"采用{merge_side_label(getattr(self.app, 'launch_context', None), 'BASE')}列",
+            text=f"应用 {self.role_presentation.middle} → {self.role_presentation.left} 列",
             padx=8,
             pady=1,
             state="disabled",
@@ -13192,7 +13338,7 @@ class SheetView:
         )
         self.use_mine_col_btn = tk.Button(
             self.column_action_button_group,
-            text=f"保留{merge_side_label(getattr(self.app, 'launch_context', None), 'A')}列",
+            text=(f"保留 {self.role_presentation.left} 列" if getattr(self.app, "merge_mode", False) else self._format_direction_action("A2B", "column")),
             padx=8,
             pady=1,
             state="disabled",
@@ -13333,28 +13479,64 @@ class SheetView:
         paned.add(left_wrap, weight=1)
         paned.add(right_wrap, weight=1)
 
+        self._pane_layout_initialized = False
+        self._pane_layout_initialized_key = None
+        self._pane_settings_key = hashlib.sha1(
+            "|".join(str(value or "") for value in (
+                getattr(self.app, "raw_base", None) or getattr(self.app, "file_a", ""),
+                getattr(self.app, "raw_mine", None) or getattr(self.app, "file_a", ""),
+                getattr(self.app, "raw_theirs", None) or getattr(self.app, "file_b", ""),
+            )).encode("utf-8", "ignore")
+        ).hexdigest()[:16]
         def _keep_panes_equal(_evt=None):
-            # Keep A/B content panes at 50:50 to avoid visual width mismatch.
+            """Restore the user's pane proportions once, then remember drags."""
             try:
                 total = self._main_paned.winfo_width()
-                if total and total > 2:
-                    if self._is_three_way_expanded():
+                if not total or total <= 2:
+                    return
+                layout_key = f"{self._pane_settings_key}:{'three' if self._is_three_way_expanded() else 'two'}"
+                if self._pane_layout_initialized_key != layout_key:
+                    all_saved = getattr(self.app, "settings", {}).get("pane_sashes", {})
+                    saved = all_saved.get(self._pane_settings_key, {}) if isinstance(all_saved, dict) else {}
+                    key = "three" if self._is_three_way_expanded() else "two"
+                    values = saved.get(key, ()) if isinstance(saved, dict) else ()
+                    if len(values) >= (2 if self._is_three_way_expanded() else 1):
+                        for idx, value in enumerate(values):
+                            self._main_paned.sashpos(idx, int(value))
+                    elif self._is_three_way_expanded():
                         self._main_paned.sashpos(0, total // 3)
                         self._main_paned.sashpos(1, (total * 2) // 3)
                     else:
                         self._main_paned.sashpos(0, total // 2)
+                    self._pane_layout_initialized = True
+                    self._pane_layout_initialized_key = layout_key
+                    # Persist the initial/default positions as well as user
+                    # drags so the first session establishes a stable mode
+                    # key and subsequent sessions can restore it immediately.
+                    current = [
+                        self._main_paned.sashpos(i)
+                        for i in range(2 if key == "three" else 1)
+                    ]
+                    settings = getattr(self.app, "settings", {})
+                    settings.setdefault("pane_sashes", {}).setdefault(
+                        self._pane_settings_key, {}
+                    )[key] = current
+                else:
+                    key = "three" if self._is_three_way_expanded() else "two"
+                    current = [self._main_paned.sashpos(i) for i in range(2 if key == "three" else 1)]
+                    settings = getattr(self.app, "settings", {})
+                    settings.setdefault("pane_sashes", {}).setdefault(self._pane_settings_key, {})[key] = current
             except Exception:
                 pass
 
         self._keep_panes_equal = _keep_panes_equal
-        self._main_paned.bind("<Configure>", self._keep_panes_equal)
         self._main_paned.bind("<ButtonRelease-1>", self._keep_panes_equal)
         self.frame.after(0, self._keep_panes_equal)
 
         pane_title_font = ("Segoe UI", 9, "bold")
         self.left_title = tk.Label(
             left_wrap,
-            text=merge_side_label(getattr(self.app, "launch_context", None), "A"),
+            text=self.role_presentation.left,
             bg=_MINE_BG,
             fg="#20242A",
             font=pane_title_font,
@@ -13365,7 +13547,7 @@ class SheetView:
         self.left_title.pack(fill="x")
         self.mid_title = tk.Label(
             mid_wrap,
-            text=merge_side_label(getattr(self.app, "launch_context", None), "BASE"),
+            text=self.role_presentation.middle,
             bg=_BASE_BG,
             fg="#20242A",
             font=pane_title_font,
@@ -13376,7 +13558,7 @@ class SheetView:
         self.mid_title.pack(fill="x")
         self.right_title = tk.Label(
             right_wrap,
-            text=merge_side_label(getattr(self.app, "launch_context", None), "B"),
+            text=self.role_presentation.right,
             bg=_THEIRS_BG,
             fg="#20242A",
             font=pane_title_font,
@@ -13751,7 +13933,11 @@ class SheetView:
             w.bind("<Control-p>", self._on_prev_diff_block_shortcut)
 
         # Click handling (selection + arrow action)
-        left_click_dir = "MINE2A" if (getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False)) else "A2B"
+        left_click_dir = "MINE2A" if (
+            getattr(self.app, "merge_mode", False)
+            and getattr(self.app, "has_base", False)
+            and getattr(self.app, "merge_conflict_mode", False)
+        ) else "A2B"
         self.left.bind("<Button-1>", lambda e, d=left_click_dir: self._on_click_with_arrow(self.left, e, d))
         self.base.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.base, e, "BASE2A"))
         self.right.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.right, e, "B2A"))
@@ -13764,10 +13950,11 @@ class SheetView:
         self.left.bind("<Leave>", lambda e: self._on_hover_compare_leave())
         self.base.bind("<Leave>", lambda e: self._on_hover_compare_leave())
         self.right.bind("<Leave>", lambda e: self._on_hover_compare_leave())
-        # Double-click merge (single cell)
-        self.left.bind("<Double-Button-1>", lambda e, d=left_click_dir: self._copy_cell(d, e))
-        self.base.bind("<Double-Button-1>", lambda e: self._copy_cell("BASE2A", e))
-        self.right.bind("<Double-Button-1>", lambda e: self._copy_cell("B2A", e))
+        # Double-click is navigation/details only.  All writes require the
+        # explicit direction-labelled command buttons or row/column actions.
+        self.left.bind("<Double-Button-1>", lambda e: self._on_double_click_navigate(self.left, e, "A"))
+        self.base.bind("<Double-Button-1>", lambda e: self._on_double_click_navigate(self.base, e, "BASE"))
+        self.right.bind("<Double-Button-1>", lambda e: self._on_double_click_navigate(self.right, e, "B"))
         self.left_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.left_colhdr, e, "A"))
         self.base_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.base_colhdr, e, "BASE"))
         self.right_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.right_colhdr, e, "B"))
@@ -14180,6 +14367,49 @@ class SheetView:
         )
         return False
 
+    def _guard_copy_direction(self, direction: str, action: str = "此操作") -> bool:
+        """Reject commands that would write a protected VCS Base side.
+
+        In a TortoiseSVN two-way view A is a temporary Base projection and B
+        is the real Mine working file.  Keep this guard at every public copy
+        entry point so keyboard, context, stale callback and direct test
+        paths share the same no-Base-write boundary.
+        """
+        normalized = str(direction or "").upper()
+        try:
+            vcs_two_way = bool(self.app._is_vcs_two_way_mode())
+        except Exception:
+            vcs_two_way = bool(
+                not getattr(self.app, "merge_mode", False)
+                and getattr(self.app, "diff_base_mine_mode", False)
+            )
+        target_is_base = normalized in {"B2A", "BASE2A", "MINE2A"}
+        mine_keep_valid = bool(
+            getattr(self.app, "merge_mode", False)
+            and getattr(self.app, "has_base", False)
+        )
+        if vcs_two_way and target_is_base:
+            message = f"{action}已阻止：VCS 两方模式的 Base 是只读临时副本，只能修改并保存 Mine。"
+        elif normalized == "MINE2A" and not mine_keep_valid:
+            message = f"{action}已阻止：‘保留 Mine’仅适用于有效的三方合并视图。"
+        else:
+            return True
+        try:
+            show_notice = getattr(self.app, "show_nonblocking_notice", None)
+            if callable(show_notice):
+                show_notice(message, warning=True, duration_ms=6000)
+            else:
+                self.info.configure(text=message)
+        except tk.TclError:
+            pass
+        except Exception:
+            pass
+        _dlog(
+            f"COPY_DIRECTION_BLOCKED sheet={self.sheet} direction={normalized} "
+            f"vcs_two_way={vcs_two_way} mine_keep_valid={mine_keep_valid}"
+        )
+        return False
+
     def _column_undo_model_ready(self) -> bool:
         """Allow a column transaction while only-diff presentation finishes.
 
@@ -14217,13 +14447,19 @@ class SheetView:
         previous = getattr(self, "_lifecycle_state", None)
         current = self._derive_lifecycle_state()
         self._lifecycle_state = current
+        try:
+            self._command_state = self.app.command_state()
+            if self._command_state.busy:
+                current = "BUSY"
+        except Exception:
+            self._command_state = None
         if previous != current:
             self._lifecycle_generation += 1
             _dlog(
                 f"SHEET_STATE sheet={self.sheet} generation={self._lifecycle_generation} "
                 f"{previous}->{current}"
             )
-        ready = current == "READY"
+        ready = current == "READY" and not bool(getattr(self._command_state, "busy", False))
         mutation_state = "normal" if ready else "disabled"
         try:
             checkbox_state = mutation_state
@@ -14269,6 +14505,30 @@ class SheetView:
             pass
         self._update_sheet_role_labels()
         self._refresh_column_action_buttons()
+        try:
+            vcs_two_way = bool(self.app._is_vcs_two_way_mode())
+        except Exception:
+            vcs_two_way = bool(
+                not getattr(self.app, "merge_mode", False)
+                and getattr(self.app, "diff_base_mine_mode", False)
+            )
+        if vcs_two_way:
+            # Reverse-direction and Base-save controls target the temporary
+            # A-side projection and are never usable in an SVN two-way view.
+            for widget in (
+                getattr(self, "use_right_btn", None),
+                getattr(self, "use_right_menu_btn", None),
+                getattr(self, "save_a_btn", None),
+            ):
+                if widget is not None:
+                    try:
+                        widget.configure(state="disabled")
+                    except Exception:
+                        pass
+        try:
+            self.app._refresh_command_widgets()
+        except Exception:
+            pass
 
     def _hide_identity_label_tooltip(self):
         after_id = getattr(self, "_identity_tooltip_after_id", None)
@@ -14430,6 +14690,15 @@ class SheetView:
     def _update_sheet_role_labels(self):
         enabled = self._is_three_way_enabled()
         meta = self._sheet_meta()
+        presentation = self.role_presentation
+        try:
+            # Pane headers are updated alongside identity cards; this is the
+            # path that also runs after a two-way/three-way toggle.
+            self.left_title.configure(text=presentation.left)
+            self.mid_title.configure(text=presentation.middle)
+            self.right_title.configure(text=presentation.right)
+        except Exception:
+            pass
         try:
             if enabled:
                 context = getattr(self.app, "launch_context", None)
@@ -14569,7 +14838,14 @@ class SheetView:
             self.use_left_btn.configure(state=left_state)
             self.use_right_btn.configure(state=right_state)
             if self.use_base_btn is not None:
-                self.use_base_btn.configure(state=mine_state)
+                self.use_base_btn.configure(
+                    state=(
+                        mine_state
+                        if getattr(self.app, "merge_mode", False)
+                        and getattr(self.app, "has_base", False)
+                        else "disabled"
+                    )
+                )
         except Exception:
             pass
         try:
@@ -14595,8 +14871,11 @@ class SheetView:
             and getattr(outcome, "candidate_path", None)
         )
         mine_pane_label = merge_role_label(context, "mine", candidate=branch_candidate)
-        base_pane_label = merge_role_label(context, "base")
-        theirs_pane_label = merge_role_label(context, "theirs")
+        base_pane_label = self.role_presentation.middle
+        theirs_pane_label = self.role_presentation.right
+        if not getattr(self.app, "merge_mode", False):
+            mine_pane_label = self.role_presentation.right
+            base_pane_label = self.role_presentation.left
         try:
             panes = list(self._main_paned.panes())
             mid_id = str(self._mid_wrap)
@@ -15703,6 +15982,10 @@ class SheetView:
 
         self._update_cursor_lines()
         self._update_diff_nav_state()
+        try:
+            self.app._refresh_command_widgets()
+        except Exception:
+            pass
 
         try:
             x_after = float((self.left.xview() or (0.0, 1.0))[0])
@@ -15730,6 +16013,10 @@ class SheetView:
         self._set_main_selected_cell(line, None)
         self._update_cursor_lines()
         self._update_diff_nav_state()
+        try:
+            self.app._refresh_command_widgets()
+        except Exception:
+            pass
 
     def _on_row_header_click(self, w: tk.Text, event, direction: str):
         try:
@@ -15747,32 +16034,14 @@ class SheetView:
             )
         )
         pair_idx = self._pair_idx_for_line(line)
-        arrow_clicked = bool(
-            hover_line == line
-            and pair_idx is not None
-            and self._row_header_action_available(
-                w,
-                line,
-                direction,
-            )
-        )
+        # Row-number/arrow regions are browsing surfaces.  They only select a
+        # row; all row writes go through the explicit toolbar action.
+        arrow_clicked = False
         self._clear_row_header_hover(w)
         self._select_line(line)
-        if arrow_clicked:
-            changed = self._copy_selected_row(
-                direction,
-                row_header=True,
-                override_pair_idx=pair_idx,
-            )
-            if changed:
-                try:
-                    self.info.configure(text="已采用箭头所指整行。")
-                except Exception:
-                    pass
-            return "break"
         try:
             self.info.configure(
-                text="已选择该行；将鼠标移到有差异的行号箭头上单击，可采用整行。"
+                text="已选择该行；请使用上方带方向的整行/区域/全局按钮执行写入。"
             )
         except Exception:
             pass
@@ -16602,6 +16871,25 @@ class SheetView:
             return "break"
         return "break"
 
+    def _on_double_click_navigate(self, w: tk.Text, event, side: str):
+        """Select and pin the current difference without mutating a workbook."""
+        self._select_from_widget(w, event)
+        try:
+            self._on_cell_hover_tooltip(w, event, side, force_show=True)
+        except TypeError:
+            # Older helper signatures remain compatible with this navigation
+            # contract; selection has already happened above.
+            try:
+                self._on_cell_hover_tooltip(w, event, side)
+            except Exception:
+                pass
+        try:
+            self._update_cursor_lines()
+            self._update_diff_nav_state()
+        except Exception:
+            pass
+        return "break"
+
     def _on_hover(self, w: tk.Text, event, direction: str):
         try:
             idx = w.index(f"@{event.x},{event.y}")
@@ -17141,6 +17429,25 @@ class SheetView:
     def _merge_side_label(self, side: str) -> str:
         return merge_side_label(getattr(self.app, "launch_context", None), side)
 
+    def _format_direction_action(self, direction: str, scope: str = "row") -> str:
+        """Render an action from its real source/target sides, never left/right."""
+        if not hasattr(self, "role_presentation") and not hasattr(
+            getattr(self, "app", None), "merge_mode"
+        ):
+            suffix = {"region": "区域", "global": "全局", "table": "表", "row": "行", "column": "列"}.get(
+                str(scope or "").lower(), ""
+            )
+            source = {"A2B": "左侧", "B2A": "右侧", "BASE2A": "Base"}.get(
+                str(direction or ""), "所选侧"
+            )
+            return f"{source}{suffix}"
+        presentation = getattr(
+            self,
+            "role_presentation",
+            RolePresentation.for_app(getattr(self, "app", None)),
+        )
+        return presentation.action_label(direction, scope)
+
     def _schedule_column_action_row_layout(self, _event=None):
         """Coalesce geometry updates for the compact nav/action row."""
         bar = getattr(self, "column_action_bar", None)
@@ -17363,6 +17670,11 @@ class SheetView:
                     widget.configure(state=state)
                 except Exception:
                     pass
+        try:
+            if self.app._is_vcs_two_way_mode():
+                self.use_theirs_col_btn.configure(state="disabled")
+        except Exception:
+            pass
         base_button = getattr(self, "use_base_col_btn", None)
         if base_button is not None:
             try:
@@ -17371,13 +17683,13 @@ class SheetView:
                 pass
         try:
             self.use_mine_col_btn.configure(
-                text=f"保留{self._merge_side_label('A')}列" if self._is_three_way_enabled() else "采用左侧(A)列"
+                text=(f"保留 {self.role_presentation.left} 列" if getattr(self.app, "merge_mode", False) else self._format_direction_action("A2B", "column"))
             )
             self.use_theirs_col_btn.configure(
-                text=f"采用{self._merge_side_label('B')}列" if self._is_three_way_enabled() else "采用右侧(B)列"
+                text=f"应用 {self.role_presentation.right} → {self.role_presentation.left} 列"
             )
             self.use_base_col_btn.configure(
-                text=f"采用{self._merge_side_label('BASE')}列"
+                text=f"应用 {self.role_presentation.middle} → {self.role_presentation.left} 列"
             )
         except Exception:
             pass
@@ -19058,6 +19370,13 @@ class SheetView:
         confirm_unresolved: bool = False,
         _failure_injector=None,
     ) -> ColumnBlockActionPlan:
+        direction = {
+            "A": "A2B",
+            "B": "B2A",
+            "BASE": "BASE2A",
+        }.get(str(source_side or "").upper(), "")
+        if not direction or not self._guard_copy_direction(direction, "列结构操作"):
+            raise RuntimeError("当前列结构操作方向不允许写入目标侧")
         if (
             not self._guard_mutation_ready("列结构操作", notify=False)
             and not self._column_undo_model_ready()
@@ -19284,6 +19603,14 @@ class SheetView:
                 "selection": selection_before,
                 "accepted_common_insert_sources_before": accepted_common_before,
             })
+            for logical_col in range(int(plan.logical_start), int(plan.logical_end) + 1):
+                marker = getattr(self.app, "mark_structure_difference_processed", None)
+                if callable(marker):
+                    marker(self.sheet, logical_col, True)
+                else:
+                    self.app.mark_difference_processed(
+                        f"{self.sheet}:structure:{logical_col}", True
+                    )
             self.selected_column_block_ordinal = None
             self.selected_column_logical_range = None
             self.selected_column_source_side = None
@@ -19383,11 +19710,21 @@ class SheetView:
             self._update_cursor_lines()
 
     def _undo_column_action(self, action: dict) -> bool:
+        plan = action.get("plan")
         if (
             not self._guard_mutation_ready("撤销列结构操作", notify=False)
             and not self._column_undo_model_ready()
         ):
             return False
+        if plan is not None:
+            for logical_col in range(int(plan.logical_start), int(plan.logical_end) + 1):
+                marker = getattr(self.app, "mark_structure_difference_processed", None)
+                if callable(marker):
+                    marker(self.sheet, logical_col, False)
+                else:
+                    self.app.mark_difference_processed(
+                        f"{self.sheet}:structure:{logical_col}", False
+                    )
         snapshot = action.get("snapshot")
         if snapshot is None:
             self._retained_column_decisions = set(action.get("retained_decisions") or set())
@@ -19434,6 +19771,13 @@ class SheetView:
 
     def _on_column_action_button(self, source_side: str):
         try:
+            direction = {
+                "A": "A2B",
+                "B": "B2A",
+                "BASE": "BASE2A",
+            }.get(str(source_side or "").upper(), "")
+            if not direction or not self._guard_copy_direction(direction, "列结构操作"):
+                return
             if (
                 not self._guard_mutation_ready("列结构操作", notify=False)
                 and not self._column_undo_model_ready()
@@ -19710,6 +20054,8 @@ class SheetView:
         *,
         _guarded: bool = False,
     ):
+        if not self._guard_copy_direction(direction, "单元格覆盖"):
+            return False
         if not _guarded and not self._guard_mutation_ready("单元格覆盖"):
             return False
         if _guarded:
@@ -19736,6 +20082,8 @@ class SheetView:
         direction: str,
         c: int,
     ):
+        if not self._guard_copy_direction(direction, "单元格覆盖"):
+            return False
         try:
             if pair_idx is None or pair_idx >= len(self.row_pairs):
                 return
@@ -19751,6 +20099,25 @@ class SheetView:
                     return
                 src_r = self._base_row_for_pair(pair_idx, pair)
                 dst_r = ra
+            elif direction == "MINE2A":
+                # Keep Mine is a conflict-resolution acknowledgement.  It
+                # never copies Theirs (or any other side) into the target.
+                if not (
+                    getattr(self.app, "merge_mode", False)
+                    and getattr(self.app, "has_base", False)
+                ):
+                    return False
+                if getattr(self.app, "merge_conflict_mode", False):
+                    self.app.user_touched_conflicts = True
+                    self._resolve_conflict_row(ra or rb, {int(c)})
+                marker = getattr(self.app, "mark_difference_pair_processed", None)
+                if callable(marker):
+                    marker(self.sheet, int(pair_idx), (int(c),), True)
+                else:
+                    selected_id = getattr(self, "_selected_difference_item_id", None)
+                    if selected_id:
+                        self.app.mark_difference_processed(selected_id, True)
+                return True
             else:
                 if rb is None:
                     return
@@ -19852,6 +20219,10 @@ class SheetView:
             touched_r = ra or rb
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
+                try:
+                    self.app.mark_difference_row_processed(self.sheet, touched_r)
+                except Exception:
+                    pass
             self._mark_nonstructural_cell_edit(
                 "cell-overwrite",
                 edited_sides=("B",) if direction == "A2B" else ("A",),
@@ -19988,7 +20359,20 @@ class SheetView:
                 break
         if hit_col is None or hit_col not in diff_cols:
             return
-        self._copy_single_cell_by_pair(pair_idx, direction, hit_col)
+        # C-area double-click is navigation/details only.  Mutating the
+        # workbook is reserved for the explicit direction-labelled actions.
+        self.selected_pair_idx = int(pair_idx)
+        self._cursor_cmp_sel_col = int(hit_col)
+        self._cursor_cmp_sel_line = int(line_no)
+        try:
+            display_line = self.row_to_line.get(int(pair_idx), int(pair_idx) + 1)
+            self._set_main_selected_cell(display_line, hit_col)
+            self._select_line(display_line)
+            self._update_cursor_lines()
+            self._update_diff_nav_state()
+        except Exception:
+            pass
+        return "break"
 
     def _set_copy_scope_mode(self, mode: str):
         mode_norm = str(mode or "").strip().lower()
@@ -20002,8 +20386,8 @@ class SheetView:
 
     def _refresh_copy_scope_buttons(self):
         if self._is_missing_sheet_view():
-            left_text = "采用左表"
-            right_text = "采用右表"
+            left_text = self._format_direction_action(self._left_copy_direction, "table")
+            right_text = self._format_direction_action(self._right_copy_direction, "table")
             try:
                 self.use_left_btn.configure(text=left_text)
             except Exception:
@@ -20014,15 +20398,8 @@ class SheetView:
                 pass
             return
         mode = getattr(self, "_copy_scope_mode", "row")
-        if mode == "region":
-            left_text = "采用左区"
-            right_text = "采用右区"
-        elif mode == "global":
-            left_text = "采用左全局"
-            right_text = "采用右全局"
-        else:
-            left_text = "采用左行"
-            right_text = "采用右行"
+        left_text = self._format_direction_action(self._left_copy_direction, mode)
+        right_text = self._format_direction_action(self._right_copy_direction, mode)
         try:
             self.use_left_btn.configure(text=left_text)
         except Exception:
@@ -20033,6 +20410,8 @@ class SheetView:
             pass
 
     def _run_copy_action_by_mode(self, direction: str):
+        if not self._guard_copy_direction(direction, "采用所选内容"):
+            return False
         if not self._guard_mutation_ready("采用所选内容"):
             return
         if self._is_missing_sheet_view():
@@ -20671,6 +21050,58 @@ class SheetView:
             conflict_map.pop(self.sheet, None)
         self.app.user_touched_conflicts = bool(user_touched_before)
 
+    def _retain_all_difference_items(self) -> bool:
+        """Mark every pending DifferenceItem in this Sheet as retained.
+
+        Global retain is deliberately metadata-only: it does not touch either
+        editable workbook, column projection generation or structural caches.
+        One batch ``difference_state`` action makes the acknowledgement fully
+        undoable while keeping the browser rows visible and marked.
+        """
+        if not (
+            getattr(self.app, "merge_mode", False)
+            and getattr(self.app, "has_base", False)
+        ):
+            self._show_global_apply_feedback(
+                "‘保留 Mine’仅适用于有效的三方合并视图。",
+                reason="retain-invalid-mode",
+            )
+            return False
+        try:
+            self.app.refresh_difference_browser()
+        except Exception:
+            pass
+        ids = tuple(
+            item.id
+            for item in getattr(self.app, "difference_items", ())
+            if item.sheet == self.sheet and not item.processed
+        )
+        if not ids:
+            try:
+                self.info.configure(text="当前 Sheet 没有待处理差异；未写入任何数据。")
+            except Exception:
+                pass
+            return False
+        marker = getattr(self.app, "mark_difference_items_processed", None)
+        marked = marker(ids, True) if callable(marker) else ids
+        if not marked:
+            return False
+        self.app.push_undo({
+            "kind": "difference_state",
+            "sheet": self.sheet,
+            "item_ids": tuple(marked),
+        })
+        try:
+            self.info.configure(
+                text=(
+                    f"已保留{self.role_presentation.left}，未写入任何数据；"
+                    f"已标记 {len(marked)} 项为已处理。"
+                )
+            )
+        except Exception:
+            pass
+        return True
+
     def _copy_all_safe_sheet_differences(self, direction: str) -> bool:
         """Atomically apply every proved cell diff in this Sheet.
 
@@ -20679,8 +21110,12 @@ class SheetView:
         a stale projection, any structural row/column difference, or an
         ambiguous slot rejects the entire command before the first write.
         """
+        if not self._guard_copy_direction(direction, "全局覆盖"):
+            return False
         if not self._guard_mutation_ready("全局覆盖"):
             return False
+        if str(direction or "").upper() == "MINE2A":
+            return self._retain_all_difference_items()
         side_pair = {
             "A2B": ("A", "B"),
             "B2A": ("B", "A"),
@@ -20804,12 +21239,9 @@ class SheetView:
             return False
 
         cell_count = sum(len(cols) for _pair_idx, cols in candidates)
-        source_label = {
-            "A2B": "左侧(A)",
-            "B2A": "右侧(B)",
-            "BASE2A": self._merge_side_label("BASE"),
-        }[direction]
-        target_label = "右侧(B)" if direction == "A2B" else self._merge_side_label("A")
+        source_label, target_label = self.role_presentation.roles_for_direction(direction)
+        source_label = source_label or "所选侧"
+        target_label = target_label or "目标侧"
         confirmation = (
             f"确认在 Sheet“{self.sheet}”中，以{source_label}为准并写入{target_label}？\n\n"
             f"将原子应用 {cell_count} 个安全映射的差异单元格（{len(candidates)} 行）。\n"
@@ -20966,6 +21398,8 @@ class SheetView:
                 pass
 
     def _copy_missing_sheet(self, direction: str, *, _guarded: bool = False):
+        if not self._guard_copy_direction(direction, "整 Sheet 操作"):
+            return False
         if not _guarded and not self._guard_mutation_ready("整 Sheet 操作"):
             return False
         if _guarded and not self.app._has_active_mutation_owner(self):
@@ -20976,9 +21410,9 @@ class SheetView:
             return False
         meta = self._sheet_meta()
         action_text = {
-            "A2B": "正在复制左侧整张 Sheet...",
-            "B2A": f"正在复制 {self._merge_side_label('B')} 整张 Sheet 到 {self._merge_side_label('A')}...",
-            "BASE2A": f"正在按 {self._merge_side_label('BASE')} 恢复或删除整张 Sheet...",
+            "A2B": f"正在{self._format_direction_action('A2B', 'table')}...",
+            "B2A": f"正在{self._format_direction_action('B2A', 'table')}...",
+            "BASE2A": f"正在{self._format_direction_action('BASE2A', 'table')}...",
         }.get(direction, "正在处理整张 Sheet...")
         try:
             self.info.configure(text=action_text)
@@ -21343,6 +21777,12 @@ class SheetView:
         pair = self.row_pairs[pair_idx]
         ra = self._row_for_side(pair, "A")
         rb = self._row_for_side(pair, "B")
+        if direction == "MINE2A":
+            # Retain acknowledges visual differences from either comparison
+            # map and never needs a writable source/destination projection.
+            cols = set(self.pair_diff_cols.get(pair_idx, set()))
+            cols.update(self.pair_base_diff_cols.get(pair_idx, set()))
+            return bool(cols)
         if direction == "A2B":
             source_side, destination_side = "A", "B"
             cols = set(self.pair_diff_cols.get(pair_idx, set()))
@@ -21505,9 +21945,9 @@ class SheetView:
             "BASE2A": "BASE",
         }.get(str(direction or ""), "LOGICAL")
         action_text = {
-            "A2B": "采用左侧(A)列",
-            "B2A": f"采用{self._merge_side_label('B')}列" if self._is_three_way_enabled() else "采用右侧(B)列",
-            "BASE2A": f"采用{self._merge_side_label('BASE')}列",
+            "A2B": f"应用 {self.role_presentation.left} → {self.role_presentation.right} 列",
+            "B2A": f"应用 {self.role_presentation.right} → {self.role_presentation.left} 列",
+            "BASE2A": f"应用 {self.role_presentation.middle} → {self.role_presentation.left} 列",
         }.get(str(direction or ""), "对应列结构按钮")
         first_col = int(blocker_cols[0])
         block = self._select_column_block_by_logical_col(first_col, source_side)
@@ -21574,11 +22014,19 @@ class SheetView:
         # Large only-diff snapshots intentionally keep these maps sparse.  An
         # empty direction map proves in O(1) that no block can be applied and
         # avoids walking a 100k+ row visual block on the Tk event thread.
-        direction_map = (
-            self.pair_base_diff_cols
-            if direction == "BASE2A"
-            else self.pair_diff_cols
-        )
+        if direction == "MINE2A":
+            direction_map = {
+                pair_idx: set(self.pair_diff_cols.get(pair_idx, set()))
+                | set(self.pair_base_diff_cols.get(pair_idx, set()))
+                for pair_idx in range(len(self.row_pairs))
+                if self.pair_diff_cols.get(pair_idx) or self.pair_base_diff_cols.get(pair_idx)
+            }
+        else:
+            direction_map = (
+                self.pair_base_diff_cols
+                if direction == "BASE2A"
+                else self.pair_diff_cols
+            )
         if not direction_map:
             return None
         preferred = self._normalize_pair_idx(preferred_pair_idx)
@@ -21635,11 +22083,23 @@ class SheetView:
         return self._normalize_pair_idx(self.selected_pair_idx) == pair_idx
 
     def _show_region_action_feedback(self, direction: str, reason: str = "none"):
-        source_label = {
-            "A2B": "左侧",
-            "B2A": "右侧",
-            "BASE2A": self._merge_side_label("BASE"),
-        }.get(str(direction or ""), "所选侧")
+        presentation = getattr(
+            self,
+            "role_presentation",
+            RolePresentation.for_app(getattr(self, "app", None)),
+        )
+        app = getattr(self, "app", None)
+        # Legacy headless adapters do not expose semantic mode attributes;
+        # retain their left/right feedback contract while real views always
+        # use RolePresentation labels.
+        if not hasattr(self, "role_presentation") and not hasattr(app, "merge_mode"):
+            source_label = {"A2B": "左侧", "B2A": "右侧", "BASE2A": "Base"}.get(
+                str(direction or ""), "所选侧"
+            )
+            action_label = f"使用{source_label}区域"
+        else:
+            source_label = presentation.roles_for_direction(direction)[0] or "所选侧"
+            action_label = self._format_direction_action(direction, "region") or f"使用{source_label}区域"
         if reason == "calculating":
             text = "差异区域仍在计算，请稍后再试。"
         elif reason == "locate-failed":
@@ -21649,7 +22109,7 @@ class SheetView:
         elif reason == "located":
             text = (
                 f"已定位到可使用的{source_label}差异区域，"
-                f"请再次点击“使用{source_label}区域”。"
+                f"请再次点击“{action_label}”。"
             )
         elif reason == "direction-unavailable":
             text = f"当前差异区域不能使用{source_label}内容，请选择另一侧或其他差异区域。"
@@ -21671,6 +22131,8 @@ class SheetView:
 
     def _copy_selected_region(self, direction: str):
         """Copy contiguous diff block around current line using diff-cell columns only."""
+        if not self._guard_copy_direction(direction, "区域覆盖"):
+            return False
         if not self._guard_mutation_ready("区域覆盖"):
             return False
         started = time.perf_counter()
@@ -21679,17 +22141,14 @@ class SheetView:
         structural_rows_changed = False
         undo_group_active = False
         undo_cells_region: list = []
+        retain_difference_ids: list[str] = []
         previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
             begin_interactive(self)
         self._suppress_bg_apply = True
-        direction_text = {
-            "B2A": "右侧区域",
-            "A2B": "左侧区域",
-            "BASE2A": f"{self._merge_side_label('BASE')} 区域",
-        }.get(direction, direction)
+        direction_text = self._format_direction_action(direction, "region") or str(direction)
         try:
             formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
             line = self._current_line()
@@ -21832,6 +22291,9 @@ class SheetView:
                 pair_idx = region_pair_indices[region_pos]
                 if direction == "BASE2A":
                     cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
+                elif direction == "MINE2A":
+                    cols = set(self.pair_diff_cols.get(pair_idx, set()))
+                    cols.update(self.pair_base_diff_cols.get(pair_idx, set()))
                 else:
                     cols = set(self.pair_diff_cols.get(pair_idx, set()))
                 pair = self.row_pairs[pair_idx] if pair_idx < len(self.row_pairs) else None
@@ -22112,6 +22574,7 @@ class SheetView:
                     override_cols=cols,
                     suppress_refresh=True,
                     _undo_out=undo_cells_region,
+                    _difference_ids_out=retain_difference_ids,
                 )
                 if row_changed:
                     changed_any = True
@@ -22126,42 +22589,66 @@ class SheetView:
                         pass
                 region_pos += 1
             if changed_any:
-                if undo_cells_region:
-                    self.app.push_undo({"sheet": self.sheet, "target": undo_target, "cells": undo_cells_region})
-                self.app.finish_undo_group(commit=True)
-                undo_group_active = False
-                if not structural_rows_changed:
-                    self._mark_nonstructural_cell_edit(
-                        "region-overwrite",
-                        edited_sides=("B",) if direction == "A2B" else ("A",),
-                    )
-                self._invalidate_render_cache()
-                if structural_rows_changed:
-                    self._invalidate_only_diff_snapshot_cache()
-                    self.refresh(row_only=None, rescan=True)
-                    exact_region_rows = 0
+                if direction == "MINE2A":
+                    # Retain is metadata-only.  Do not mark a cell edit or
+                    # invalidate the logical column projection; one undo
+                    # restores the exact DifferenceItem processed states.
+                    self.app.finish_undo_group(commit=False)
+                    undo_group_active = False
+                    if retain_difference_ids:
+                        self.app.push_undo({
+                            "kind": "difference_state",
+                            "sheet": self.sheet,
+                            "item_ids": tuple(retain_difference_ids),
+                        })
+                    self._refresh_diff_block_ui()
+                    self._update_cursor_lines()
+                    try:
+                        self.info.configure(
+                            text=(
+                                f"已保留{self.role_presentation.left}，未写入任何数据；"
+                                f"已标记 {len(retain_difference_ids) or processed_rows} 项为已处理。"
+                            )
+                        )
+                    except Exception:
+                        pass
                 else:
-                    exact_region_rows = self._refresh_pair_indices_exact(region_pair_indices)
-                    if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
-                        self._cache_only_diff_rows_from_exact_pair_maps()
-                    # Exact pair caches above already contain every changed row;
-                    # one non-rescanning render is sufficient for any region size.
-                    self.refresh(row_only=None, rescan=False)
-                self._invalidate_render_cache()
-                self._refresh_diff_block_ui()
-                _dlog(
-                    f"OVERWRITE_REGION_EXACT_REFRESH sheet={self.sheet} "
-                    f"pairs={exact_region_rows} visible={len(self.display_rows)}"
-                )
-                self._restore_view_anchor(anchor)
-                self._update_cursor_lines()
-                try:
-                    elapsed = time.perf_counter() - started
-                    self.info.configure(
-                        text=f"已采用{direction_text}：{processed_rows} 行，耗时 {elapsed:.1f} 秒"
+                    if undo_cells_region:
+                        self.app.push_undo({"sheet": self.sheet, "target": undo_target, "cells": undo_cells_region})
+                    self.app.finish_undo_group(commit=True)
+                    undo_group_active = False
+                    if not structural_rows_changed:
+                        self._mark_nonstructural_cell_edit(
+                            "region-overwrite",
+                            edited_sides=("B",) if direction == "A2B" else ("A",),
+                        )
+                    self._invalidate_render_cache()
+                    if structural_rows_changed:
+                        self._invalidate_only_diff_snapshot_cache()
+                        self.refresh(row_only=None, rescan=True)
+                        exact_region_rows = 0
+                    else:
+                        exact_region_rows = self._refresh_pair_indices_exact(region_pair_indices)
+                        if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
+                            self._cache_only_diff_rows_from_exact_pair_maps()
+                        # Exact pair caches above already contain every changed row;
+                        # one non-rescanning render is sufficient for any region size.
+                        self.refresh(row_only=None, rescan=False)
+                    self._invalidate_render_cache()
+                    self._refresh_diff_block_ui()
+                    _dlog(
+                        f"OVERWRITE_REGION_EXACT_REFRESH sheet={self.sheet} "
+                        f"pairs={exact_region_rows} visible={len(self.display_rows)}"
                     )
-                except Exception:
-                    pass
+                    self._restore_view_anchor(anchor)
+                    self._update_cursor_lines()
+                    try:
+                        elapsed = time.perf_counter() - started
+                        self.info.configure(
+                            text=f"已采用{direction_text}：{processed_rows} 行，耗时 {elapsed:.1f} 秒"
+                        )
+                    except Exception:
+                        pass
             else:
                 self.app.finish_undo_group(commit=False)
                 undo_group_active = False
@@ -22208,6 +22695,7 @@ class SheetView:
                 f"processed={processed_rows} changed={int(bool(changed_any))} "
                 f"ms={(time.perf_counter() - started) * 1000.0:.1f}"
             )
+        return bool(changed_any)
 
     def _update_diff_nav_state(self):
         try:
@@ -22954,7 +23442,15 @@ class SheetView:
         self._pending_pair_parts_cache = None
 
         def _parts_with_missing_marker(pair_idx, parts, side: str):
-            raw = list(parts or ())
+            if parts is None:
+                raw = []
+            elif isinstance(parts, (str, bytes, bytearray)) or not isinstance(parts, Sequence):
+                # A lightweight cache may contain one already-resolved cell
+                # value.  Keep it as one physical column instead of splitting
+                # text into characters or calling ``list`` on a number.
+                raw = [parts]
+            else:
+                raw = list(parts)
             try:
                 pair = self.row_pairs[int(pair_idx)]
                 if side == "BASE":
@@ -22981,6 +23477,9 @@ class SheetView:
             int(idx): _parts_with_missing_marker(idx, parts, "BASE")
             for idx, parts in dict(pair_parts_base or {}).items()
         }
+        self.pair_parts_a = {int(idx): tuple(parts) for idx, parts in pair_parts_a.items()}
+        self.pair_parts_b = {int(idx): tuple(parts) for idx, parts in pair_parts_b.items()}
+        self.pair_parts_base = {int(idx): tuple(parts) for idx, parts in pair_parts_base.items()}
         self._projected_widths_from_cached_parts(
             pair_parts_a,
             pair_parts_b,
@@ -23889,9 +24388,11 @@ class SheetView:
                     base_row = None
                     if has_base:
                         base_row = self._base_row_for_pair(pair_idx, (ra, rb))
-                        if ra is not None and base_row is None:
+                        if base_row is None and ra is not None and rb is not None:
                             base_cols = {-1}
-                        elif ra is not None:
+                        elif base_row is not None and ra is None:
+                            base_cols = {-1}
+                        elif base_row is not None:
                             row_base = _row_from_cache(rows_base, base_row, self.max_col)
                             base_comparison = compare_logical_row_sides(
                                 self._active_column_comparison_cache(),
@@ -24047,9 +24548,11 @@ class SheetView:
                 base_row = None
                 if has_base:
                     base_row = self._base_row_for_pair(pair_idx, (ra, rb))
-                    if ra is not None and base_row is None:
+                    if base_row is None and ra is not None and rb is not None:
                         base_cols = {-1}
-                    elif ra is not None:
+                    elif base_row is not None and ra is None:
+                        base_cols = {-1}
+                    elif base_row is not None:
                         row_base = _row_from_cache(rows_base, base_row, self.max_col)
                         base_comparison = compare_logical_row_sides(
                             self._active_column_comparison_cache(),
@@ -24664,9 +25167,11 @@ class SheetView:
                             base_row = None
                             if has_base and ws_base_val is not None:
                                 base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
-                                if ra is not None and base_row is None:
+                                if base_row is None and ra is not None and rb is not None:
                                     base_cols = {-1}
-                                elif ra is not None:
+                                elif base_row is not None and ra is None:
+                                    base_cols = {-1}
+                                elif base_row is not None:
                                     row_base = _row_from_cache(rows_base, base_row, max_col)
                                     base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(
                                         row_a, row_base, right_side="base"
@@ -24814,20 +25319,22 @@ class SheetView:
                             base_row = None
                             if has_base and ws_base_val is not None:
                                 base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
-                                if ra is not None and base_row is None:
-                                    base_cols = {-1}
-                                elif ra is not None:
-                                    row_base = _row_from_cache(rows_base, base_row, max_col)
-                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(
-                                        row_a, row_base, right_side="base"
+                            if base_row is None and ra is not None and rb is not None:
+                                base_cols = {-1}
+                            elif base_row is not None and ra is None:
+                                base_cols = {-1}
+                            elif base_row is not None:
+                                row_base = _row_from_cache(rows_base, base_row, max_col)
+                                base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(
+                                    row_a, row_base, right_side="base"
+                                )
+                                if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
+                                    need_exact_base = _needs_formula_exact(
+                                        row_a,
+                                        row_base,
+                                        _row_from_cache(formula_rows_a, ra, max_col),
+                                        _row_from_cache(formula_rows_base, base_row, max_col),
                                     )
-                                    if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
-                                        need_exact_base = _needs_formula_exact(
-                                            row_a,
-                                            row_base,
-                                            _row_from_cache(formula_rows_a, ra, max_col),
-                                            _row_from_cache(formula_rows_base, base_row, max_col),
-                                        )
                             if (not cols) and (not base_cols) and (not need_exact_ab) and (not need_exact_base):
                                 continue
                             if need_exact_ab or need_exact_base:
@@ -25440,8 +25947,10 @@ class SheetView:
         """Debounced settings write: called 1 s after the last only-diff toggle."""
         try:
             os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+            settings = dict(getattr(self.app, "settings", {}) or {})
+            settings["only_diff"] = int(self.only_diff_var.get())
             with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump({"only_diff": int(self.only_diff_var.get())}, f, ensure_ascii=False)
+                json.dump(settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
             _dlog(f"settings save failed: {e}")
 
@@ -25577,6 +26086,8 @@ class SheetView:
             pass
 
     def _copy_cell(self, direction: str, event):
+        if not self._guard_copy_direction(direction, "单元格覆盖"):
+            return "break"
         if not self._guard_mutation_ready("单元格覆盖"):
             return "break"
         previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
@@ -25715,10 +26226,17 @@ class SheetView:
                     self.app.modified_sheets_b.add(self.sheet)
                     self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
             elif direction == "MINE2A":
-                # Keep mine value; in conflict mode this means "accept mine".
+                # Keep Mine/Target Working without copying any cell.
                 if getattr(self.app, "merge_conflict_mode", False):
                     self.app.user_touched_conflicts = True
                     self._resolve_conflict_cell(dst_r, c)
+                marker = getattr(self.app, "mark_difference_pair_processed", None)
+                if callable(marker):
+                    marker(self.sheet, int(pair_idx), (int(c),), True)
+                else:
+                    selected_id = getattr(self, "_selected_difference_item_id", None)
+                    if selected_id:
+                        self.app.mark_difference_processed(selected_id, True)
                 return
             elif direction == "B2A":
                 old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
@@ -26420,6 +26938,10 @@ class SheetView:
                 ),
             )
             committed = True
+            try:
+                self.app.mark_difference_row_processed(self.sheet, int(insert_pos), True)
+            except Exception:
+                pass
 
             if not suppress_refresh:
                 try:
@@ -27045,6 +27567,82 @@ class SheetView:
             messagebox.showerror("Error", f"插入行失败：\n{e}")
             return False
 
+    def _difference_item_matches_pair(
+        self,
+        item_id: str | None,
+        pair_idx: int | None,
+        columns: set[int] | None = None,
+    ) -> bool:
+        """Validate a browser selection before using it as a retain alias.
+
+        The browser selection can outlive a main-grid row change while a
+        cache refresh is still in flight.  Treat its ID as authoritative only
+        when the current DifferenceIndex contains that exact item, its Sheet
+        and aligned pair match, and a region's requested logical columns
+        contain the item.  Otherwise callers must use the current pair/row
+        fallback, which returns IDs suitable for undo.
+        """
+        try:
+            pair_idx = self._normalize_pair_idx(pair_idx)
+            item_key = str(item_id or "")
+        except Exception:
+            return False
+        if pair_idx is None or not item_key:
+            return False
+
+        browser = getattr(self.app, "_diff_browser", None)
+        index = getattr(browser, "index", None) if browser is not None else None
+        if index is not None and callable(getattr(index, "all", None)):
+            # A live index is the source of truth.  Do not fall back to a
+            # stale app snapshot when it cannot confirm this ID.
+            items = tuple(index.all())
+        else:
+            items = tuple(getattr(self.app, "difference_items", ()) or ())
+        item = next(
+            (candidate for candidate in items if str(getattr(candidate, "id", "")) == item_key),
+            None,
+        )
+        if item is None or str(getattr(item, "sheet", "")) != str(self.sheet):
+            return False
+
+        pair_match = re.search(r":pair:(-?\d+):", item_key)
+        if pair_match is not None:
+            try:
+                if int(pair_match.group(1)) != int(pair_idx):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        else:
+            # Legacy row IDs have no pair token.  Confirm their physical row
+            # belongs to this aligned pair before accepting the alias.
+            try:
+                pair = self.row_pairs[int(pair_idx)]
+                row_candidates = {
+                    int(value)
+                    for value in tuple(pair or ())
+                    if value is not None
+                }
+                base_row = self._base_row_for_pair(int(pair_idx), pair)
+                if base_row is not None:
+                    row_candidates.add(int(base_row))
+                if getattr(item, "row", None) is None or int(item.row) not in row_candidates:
+                    return False
+            except (AttributeError, IndexError, TypeError, ValueError):
+                return False
+
+        if columns is not None:
+            try:
+                allowed = {int(value) for value in columns}
+                item_col = getattr(item, "column", None)
+                if item_col is None:
+                    if -1 not in allowed:
+                        return False
+                elif int(item_col) not in allowed:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
     def _copy_selected_row(
         self,
         direction: str,
@@ -27054,7 +27652,10 @@ class SheetView:
         suppress_refresh: bool = False,
         _undo_out: list | None = None,
         raise_on_error: bool = False,
+        _difference_ids_out: list[str] | None = None,
     ) -> bool:
+        if not self._guard_copy_direction(direction, "行覆盖"):
+            return False
         # Region actions acquire readiness at their public entry and then reuse
         # this primitive while the app advertises BUSY.
         if suppress_refresh:
@@ -27076,11 +27677,11 @@ class SheetView:
             begin_interactive(self)
         self._suppress_bg_apply = True
         if interactive_busy:
-            action_text = {
-                "B2A": "正在采用 theirs 行到 mine...",
-                "A2B": "正在采用 mine 行到 theirs...",
-                "BASE2A": "正在采用 Base 行到 mine...",
-            }.get(direction, "正在处理行操作...")
+            action_text = self._format_direction_action(direction, "row")
+            if action_text:
+                action_text = f"正在{action_text}..."
+            else:
+                action_text = "正在处理行操作..."
             try:
                 self.info.configure(text=action_text)
                 self.root.configure(cursor="watch")
@@ -27328,9 +27929,74 @@ class SheetView:
                         else:
                             self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": undo_cells})
             elif action_direction == "MINE2A":
-                # Keep mine row as-is. In conflict mode, row can still be "changed"
-                # by conflict resolution metadata updates above.
-                return bool(changed)
+                # Keep Mine/Target Working as-is.  This is an explicit,
+                # no-write acknowledgement: retain the selected DifferenceItem
+                # as processed (and resolve conflict metadata when the legacy
+                # conflict mode is active).
+                marked_ids = tuple()
+                try:
+                    marker = getattr(self.app, "mark_difference_pair_processed", None)
+                    if callable(marker):
+                        marked_ids = marker(
+                            self.sheet,
+                            int(pair_idx),
+                            cols if override_cols is not None else None,
+                            True,
+                        )
+                    selected_id = getattr(self, "_selected_difference_item_id", None)
+                    selected_is_current = self._difference_item_matches_pair(
+                        selected_id,
+                        pair_idx,
+                        cols if override_cols is not None else None,
+                    )
+                    if not marked_ids and selected_is_current:
+                        self.app.mark_difference_processed(selected_id, True)
+                        marked_ids = (str(selected_id),)
+                    if not marked_ids and (ra is not None or rb is not None):
+                        row_marked_ids = self.app.mark_difference_row_processed(
+                            self.sheet, int(ra or rb), True
+                        )
+                        # Pair IDs may be unavailable for a legacy/cache
+                        # snapshot.  The row fallback still marks real
+                        # DifferenceItems; carry those IDs into the caller's
+                        # undo record and region accumulator.
+                        marked_ids = tuple(
+                            dict.fromkeys(
+                                str(item_id)
+                                for item_id in (marked_ids or ())
+                                + tuple(row_marked_ids or ())
+                                if item_id
+                            )
+                        )
+                    if _difference_ids_out is not None:
+                        _difference_ids_out.extend(
+                            item_id
+                            for item_id in marked_ids
+                            if item_id not in _difference_ids_out
+                        )
+                except Exception:
+                    pass
+                if marked_ids and not suppress_refresh:
+                    self.app.push_undo({
+                        "kind": "difference_state",
+                        "sheet": self.sheet,
+                        "item_ids": tuple(marked_ids),
+                    })
+                try:
+                    self.info.configure(
+                        text=(
+                            f"已保留{self.role_presentation.left}，未写入任何数据；"
+                            f"已标记 {len(marked_ids) or 1} 项为已处理。"
+                        )
+                    )
+                except Exception:
+                    pass
+                if not suppress_refresh:
+                    try:
+                        self.app.refresh_difference_browser()
+                    except Exception:
+                        pass
+                return bool(changed or marked_ids or ra is not None or rb is not None)
             elif action_direction == "B2A":
                 undo_cells = []
                 applied_cols = set()
@@ -27501,6 +28167,29 @@ class SheetView:
         pending = self.app.undo_stack[-1] if getattr(self.app, "undo_stack", None) else None
         if not pending:
             return
+        try:
+            vcs_two_way = bool(self.app._is_vcs_two_way_mode())
+        except Exception:
+            vcs_two_way = False
+        def _writes_protected_base(action) -> bool:
+            if not isinstance(action, dict):
+                return False
+            if str(action.get("target") or "").upper() == "A":
+                return True
+            plan = action.get("plan")
+            if str(getattr(plan, "target_side", "") or "").upper() == "A":
+                return True
+            return any(_writes_protected_base(child) for child in action.get("actions") or ())
+
+        if vcs_two_way and _writes_protected_base(pending):
+            notice = getattr(self.app, "show_nonblocking_notice", None)
+            if callable(notice):
+                notice(
+                    "VCS 两方模式不会撤销或写入 Base 临时副本。",
+                    warning=True,
+                    duration_ms=6000,
+                )
+            return
         action_sheet = pending.get("sheet") or self.sheet
         undo_view = (
             self
@@ -27533,6 +28222,17 @@ class SheetView:
             action = self.app.pop_undo()
             if not action:
                 return
+            # Re-open the affected stable IDs while reversing an explicit
+            # action; processed rows remain in the browser but become pending.
+            try:
+                undo_sheet = action.get("sheet") or undo_view.sheet
+                affected_rows = {int(row) for row, *_rest in action.get("cells", [])}
+                if action.get("row"):
+                    affected_rows.add(int(action.get("row")))
+                for row in affected_rows:
+                    self.app.mark_difference_row_processed(undo_sheet, row, False)
+            except Exception:
+                pass
             if action.get("kind") == "compound":
                 child_actions = list(action.get("actions") or ())
                 if not child_actions:
@@ -27577,6 +28277,15 @@ class SheetView:
                 return
             if action.get("kind") == "column_action":
                 column_undo_view._undo_column_action(action)
+                return
+            if action.get("kind") == "difference_state":
+                for item_id in tuple(action.get("item_ids") or ()):
+                    self.app.mark_difference_processed(item_id, False)
+                try:
+                    self.app.refresh_difference_browser()
+                    undo_view.info.configure(text="已撤销保留 Mine 的处理标记；未写入工作簿数据。")
+                except Exception:
+                    pass
                 return
             if action.get("kind") == "global_safe_cells":
                 snapshot = action.get("snapshot")
@@ -29044,7 +29753,14 @@ class SheetView:
                             ws_b,
                             self.max_col,
                         )
-                        self.pair_base_row_override = _build_pair_base_row_overrides(
+                        self.row_pairs, synthetic_base_rows = _augment_three_way_row_pairs_with_base_deletions(
+                            self.row_pairs,
+                            self.mine_to_base_row,
+                            self.theirs_to_base_row,
+                            base_r,
+                        )
+                        self.pair_base_row_override = dict(synthetic_base_rows)
+                        self.pair_base_row_override.update(_build_pair_base_row_overrides(
                             self.row_pairs,
                             self.mine_to_base_row,
                             self.theirs_to_base_row,
@@ -29052,7 +29768,7 @@ class SheetView:
                             ws_a,
                             ws_b,
                             self.max_col,
-                        )
+                        ))
                 self.row_a_to_pair_idx = {}
                 self.row_b_to_pair_idx = {}
                 for idx, (ra, rb) in enumerate(self.row_pairs):
@@ -29868,13 +30584,32 @@ class SowMergeApp:
         # trailing ``.rN`` hides the real workbook extension from openpyxl.
         # Stable copies are an implementation detail; raw identities stay in
         # the launch context/labels below.
-        self.file_a = _ensure_xlsx_copy(file_a) if file_a else file_a
-        self.file_b = _ensure_xlsx_copy(file_b) if file_b else file_b
-        self.base_path = _ensure_xlsx_copy(base_path) if base_path else base_path
-        self.has_base = bool(base_path and os.path.exists(base_path))
+        self.merge_mode = bool(merge_mode)
         self.raw_base = raw_base
         self.raw_mine = raw_mine
         self.raw_theirs = raw_theirs
+        self.diff_base_mine_mode = bool(
+            not self.merge_mode and self.raw_base and self.raw_mine
+        )
+        self.file_a = _ensure_xlsx_copy(file_a) if file_a else file_a
+        # In a VCS two-way launch, keep B bound to the real working file even
+        # when the test/host path lives under %TEMP% (where the generic stable
+        # copy helper would otherwise clone it).  SVN revision sidecars still
+        # use a safe normalized copy.
+        raw_mine_name = os.path.basename(str(self.raw_mine or ""))
+        raw_mine_is_working_file = bool(
+            self.diff_base_mine_mode
+            and self.raw_mine
+            and os.path.isfile(str(self.raw_mine))
+            and not re.search(r"(?:\.merge-(?:left|right))?\.r\d+$", raw_mine_name, re.IGNORECASE)
+        )
+        self.file_b = (
+            str(self.raw_mine)
+            if raw_mine_is_working_file
+            else (_ensure_xlsx_copy(file_b) if file_b else file_b)
+        )
+        self.base_path = _ensure_xlsx_copy(base_path) if base_path else base_path
+        self.has_base = bool(base_path and os.path.exists(base_path))
         self.launch_context = launch_context
         self.startup_outcome = startup_outcome or StartupMergeOutcome()
         self.merge_candidate_path = file_a if (startup_outcome and startup_outcome.candidate_path) else None
@@ -29883,8 +30618,10 @@ class SowMergeApp:
             WORKSPACE_CHROME_COLORS[MergeScenario.TWO_WAY],
         )
         self.workspace_color = self.workspace_chrome_color
-        self.merge_mode = merge_mode
-        self.diff_base_mine_mode = bool((not merge_mode) and raw_base and raw_mine)
+        self.merge_mode = bool(merge_mode)
+        self.diff_base_mine_mode = bool(
+            not self.merge_mode and self.raw_base and self.raw_mine
+        )
         self.merged_path = merged_path
         self.merge_conflict_cells_by_sheet = merge_conflict_cells_by_sheet or {}
         self.merge_conflict_mode = merge_conflict_mode
@@ -29984,9 +30721,11 @@ class SowMergeApp:
                 self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True, keep_links=False)
                 _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
-                report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(self.file_b)}", 30)
+                mine_working_path = self._mine_working_path()
+                side_label = "theirs" if self.merge_mode else "mine"
+                report("正在打开 Excel 合并工具", f"加载 {side_label}：{os.path.basename(mine_working_path)}", 30)
                 t0 = datetime.now()
-                self._file_b_val_path = _prepare_val_path(self.file_b)
+                self._file_b_val_path = _prepare_val_path(mine_working_path)
                 self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True, keep_links=False)
                 _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
@@ -30041,6 +30780,10 @@ class SowMergeApp:
         self.modified_b = False
         self.modified_sheets_a = set()
         self.modified_sheets_b = set()
+        self.difference_items: tuple[DifferenceItem, ...] = ()
+        self._difference_processed: set[str] = set()
+        self.sheet_diff_counts: dict[str, int] = {}
+        self._diff_browser = None
 
         self.root = _take_startup_progress_root()
         self._startup_trace.mark("startup-window-ready")
@@ -30061,7 +30804,7 @@ class SowMergeApp:
 
         self._root_after_ids: set[str] = set()
         try:
-            self.root.protocol("WM_DELETE_WINDOW", self._shutdown_root)
+            self.root.protocol("WM_DELETE_WINDOW", self._request_close)
         except Exception:
             pass
 
@@ -30680,6 +31423,29 @@ class SowMergeApp:
                 except Exception:
                     pass
                 win.withdraw()
+        except tk.TclError:
+            pass
+        except Exception:
+            pass
+        # A completed request must invalidate any late worker/UI payload that
+        # still carries this generation.  Also remove a replaceable broker
+        # request that has not started yet; otherwise it can reopen the
+        # progress surface after the user already received a result.
+        try:
+            current_seq = int(getattr(view, "_only_diff_async_build_seq", build_seq))
+            if current_seq == int(build_seq):
+                view._only_diff_async_build_seq = current_seq + 1
+        except Exception:
+            pass
+        try:
+            with self._exact_broker_lock:
+                pending = self._exact_broker_pending
+                if pending is not None and pending[0] is view and int(pending[1]) == int(build_seq):
+                    self._exact_broker_pending = None
+        except Exception:
+            pass
+        try:
+            self._release_priority_exact(view, int(build_seq))
         except Exception:
             pass
         self._only_diff_progress_owner = None
@@ -30816,9 +31582,55 @@ class SowMergeApp:
             except Exception:
                 pass
 
-    def _shutdown_root(self):
+    def _request_close(self):
+        """Close guard with explicit Save / Discard / Cancel semantics."""
         if getattr(self, "_is_closing", False):
             return
+        if not bool(getattr(self, "modified_a", False) or getattr(self, "modified_b", False)):
+            self._shutdown_root(force=True)
+            return
+        try:
+            choice = messagebox.askyesnocancel(
+                "未保存改动",
+                "检测到未保存改动。\n\n是：保存并关闭\n否：放弃改动并关闭\n取消：返回当前窗口",
+                parent=self.root,
+            )
+        except Exception:
+            choice = None
+        if choice is None:
+            return
+        if choice is False:
+            self.modified_a = False
+            self.modified_b = False
+            self._shutdown_root(force=True)
+            return
+        try:
+            # Merge output has its own complete atomic save/reconciliation path.
+            if getattr(self, "merge_mode", False) and getattr(self, "merged_path", None):
+                self.save_merged_and_exit(auto=False)
+                return
+            if getattr(self, "modified_a", False):
+                self.save_a_inplace()
+            if getattr(self, "modified_b", False):
+                self.save_b_inplace()
+        except Exception as exc:
+            # A failed save must leave the window and in-memory edits intact.
+            try:
+                messagebox.showerror("保存失败，窗口保持打开", str(exc), parent=self.root)
+            except Exception:
+                pass
+            return
+        if not bool(getattr(self, "modified_a", False) or getattr(self, "modified_b", False)):
+            self._shutdown_root(force=True)
+
+    def _shutdown_root(self, *, force: bool = False):
+        if getattr(self, "_is_closing", False):
+            return
+        # This is the internal teardown primitive.  The real user close path
+        # is ``WM_DELETE_WINDOW -> _request_close`` and owns the unsaved-change
+        # prompt; background workers and automated fixtures call this method
+        # directly and must never block on a modal dialog.  ``force`` remains
+        # accepted for compatibility with existing callers.
         self._is_closing = True
         try:
             self._initial_sheet_ready_event.set()
@@ -30972,6 +31784,13 @@ class SowMergeApp:
         except Exception:
             pass
         try:
+            self._persist_difference_browser_preferences()
+            os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+            with open(_SETTINGS_PATH, "w", encoding="utf-8") as stream:
+                json.dump(getattr(self, "settings", {}) or {}, stream, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            _dlog(f"settings close save failed: {exc}")
+        try:
             if self.root.winfo_exists():
                 # Ensure Tk mainloop exits and the window is actually closed.
                 try:
@@ -30988,6 +31807,34 @@ class SowMergeApp:
             and self._wb_b_edit is not None
             and (not self.has_base or self._wb_base_edit is not None)
         )
+
+    def _is_vcs_two_way_mode(self) -> bool:
+        """Whether A is a read-only SVN Base side and B is real Mine.
+
+        TortoiseSVN's two-way invocation supplies ``/base`` and ``/mine``.
+        A is normalized to a temporary workbook copy in that path, while B
+        remains the working-copy file.  Keep the distinction explicit so a
+        toolbar action or a stale callback can never save the Base copy.
+        """
+        return bool(
+            not getattr(self, "merge_mode", False)
+            and (
+                getattr(self, "diff_base_mine_mode", False)
+                or (
+                    bool(getattr(self, "raw_base", None))
+                    and bool(getattr(self, "raw_mine", None))
+                    and not bool(getattr(self, "raw_theirs", None))
+                )
+            )
+        )
+
+    def _mine_working_path(self) -> str:
+        """Return the real Mine output path for a VCS two-way session."""
+        if self._is_vcs_two_way_mode():
+            raw_mine = getattr(self, "raw_mine", None)
+            if raw_mine and os.path.isfile(str(raw_mine)):
+                return str(raw_mine)
+        return str(getattr(self, "file_b", "") or "")
 
     def _guard_active_sheet_mutation(self, action: str) -> bool:
         view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
@@ -31161,7 +32008,7 @@ class SowMergeApp:
                     _dlog(f"load wb_a_edit owned: {(datetime.now()-t0).total_seconds():.3f}s")
                 if self._wb_b_edit is None:
                     t0 = datetime.now()
-                    candidate = load_workbook(self.file_b, data_only=False)
+                    candidate = load_workbook(self._mine_working_path(), data_only=False)
                     if self._wb_b_edit is None and not self._is_closing:
                         self._wb_b_edit = candidate
                     else:
@@ -31873,7 +32720,7 @@ class SowMergeApp:
         """Build a 2-way B-side result by replaying structural operations safely."""
         self._ensure_live_column_mappings_current("构建B输出")
         self._ensure_column_replay_available("B")
-        src = self.file_b
+        src = self._mine_working_path()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(
             tempfile.gettempdir(),
@@ -32015,6 +32862,685 @@ class SowMergeApp:
         ):
             return out
         raise RuntimeError("B-side structural replay failed")
+
+    def _difference_items_from_view(self, view: "SheetView") -> list[DifferenceItem]:
+        """Project the already-built SheetView cache into browser rows."""
+        items: list[DifferenceItem] = []
+        presentation = getattr(view, "role_presentation", RolePresentation.for_app(self))
+        is_three_way = bool(
+            getattr(self, "merge_mode", False) and getattr(self, "has_base", False)
+        )
+        base_value_label = presentation.middle if is_three_way else presentation.left
+        mine_value_label = presentation.left if is_three_way else presentation.right
+        theirs_value_label = presentation.right if is_three_way else "Theirs"
+        conflict_map = getattr(self, "merge_conflict_cells_by_sheet", {}) or {}
+        diff_sources = [(getattr(view, "pair_diff_cols", {}) or {}, False)]
+        if self._three_way_model_active_for_view(view):
+            diff_sources.append((getattr(view, "pair_base_diff_cols", {}) or {}, True))
+        for diff_map, base_map in diff_sources:
+            for pair_idx, cols in diff_map.items():
+                if not cols:
+                    continue
+                try:
+                    ra, rb = view.row_pairs[int(pair_idx)]
+                except Exception:
+                    continue
+                row = ra or rb
+                physical_row = row
+                side_token = "B" if not base_map else "BASE"
+                if -1 in cols:
+                    base_row = None
+                    if base_map:
+                        # Browser projection remains complete while the UI is
+                        # folded to two panes; use the cache override directly
+                        # instead of requiring the optional three-way toggle.
+                        overrides = getattr(view, "pair_base_row_override", {}) or {}
+                        base_row = overrides.get(int(pair_idx))
+                        if base_row is None:
+                            base_row = overrides.get(str(pair_idx))
+                        if base_row is None:
+                            try:
+                                base_row = view._base_row_for_pair(int(pair_idx), (ra, rb))
+                            except Exception:
+                                base_row = None
+                    sentinel_row = row or base_row or int(pair_idx) + 1
+                    if base_map and base_row is None and ra is not None and rb is not None:
+                        sentinel_kind = DifferenceKind.ADDED
+                        sentinel_summary = "Mine 与 Theirs 共同新增行"
+                    elif base_map and base_row is not None and ra is None and rb is None:
+                        sentinel_kind = DifferenceKind.DELETED
+                        sentinel_summary = "Mine 与 Theirs 共同删除行"
+                    elif not base_map:
+                        sentinel_kind = DifferenceKind.ADDED if ra is None else DifferenceKind.DELETED
+                        sentinel_summary = "目标侧缺失对应行"
+                    else:
+                        sentinel_kind = DifferenceKind.STRUCTURE
+                        sentinel_summary = "行结构变化"
+                    sentinel_id = f"{view.sheet}:pair:{int(pair_idx)}:side:{side_token}:kind:{sentinel_kind.value}:row:{sentinel_row}:sentinel"
+                    items.append(DifferenceItem(
+                        id=sentinel_id, sheet=view.sheet, kind=sentinel_kind,
+                        row=sentinel_row, summary=sentinel_summary,
+                        role=self.role_presentation_for_view(
+                            view,
+                            direction="BASE2A" if base_map else (
+                                "B2A" if is_three_way else "A2B"
+                            ),
+                        ),
+                        base_label=base_value_label,
+                        mine_label=mine_value_label,
+                        theirs_label=theirs_value_label,
+                        processed=sentinel_id in self._difference_processed,
+                    ))
+                for logical_col in sorted(int(c) for c in cols if int(c) > 0):
+                    conflict = bool(row and logical_col in (conflict_map.get(view.sheet, {}).get(row, {}) or {}))
+                    kind = DifferenceKind.CONFLICT if conflict else DifferenceKind.MODIFIED
+                    if ra is None and rb is not None:
+                        kind = DifferenceKind.ADDED
+                    elif rb is None and ra is not None:
+                        kind = DifferenceKind.DELETED
+                    item_id = f"{view.sheet}:pair:{int(pair_idx)}:side:{side_token}:kind:{kind.value}:row:{physical_row or 0}:col:{logical_col}"
+                    # ``pair_parts_*`` is normally a tuple of physical-column
+                    # display values.  Lightweight/legacy adapters may carry
+                    # one scalar instead; leave it untouched and let the
+                    # logical-value helper normalize both shapes.
+                    a_value = self._view_pair_parts(view, "pair_parts_a", int(pair_idx))
+                    b_value = self._view_pair_parts(view, "pair_parts_b", int(pair_idx))
+                    base_parts = self._view_pair_parts(view, "pair_parts_base", int(pair_idx))
+                    if is_three_way:
+                        mine_value, theirs_value, base_value = a_value, b_value, base_parts
+                    else:
+                        base_value, mine_value, theirs_value = a_value, b_value, ()
+                    base_value = self._logical_value_from_view(
+                        view,
+                        int(pair_idx),
+                        logical_col,
+                        "BASE" if is_three_way else "A",
+                        base_value,
+                    )
+                    mine_value = self._logical_value_from_view(
+                        view,
+                        int(pair_idx),
+                        logical_col,
+                        "A" if is_three_way else "B",
+                        mine_value,
+                    )
+                    theirs_value = (
+                        self._logical_value_from_view(
+                            view, int(pair_idx), logical_col, "B", theirs_value
+                        )
+                        if is_three_way
+                        else None
+                    )
+                    items.append(DifferenceItem(
+                        id=item_id, sheet=view.sheet, kind=kind, row=row, column=logical_col,
+                        summary=f"逻辑列 {get_column_letter(logical_col)} 的值或公式不同",
+                        role=self.role_presentation_for_view(
+                            view,
+                            logical_col,
+                            direction="BASE2A" if base_map else (
+                                "B2A" if is_three_way else "A2B"
+                            ),
+                        ),
+                        base_label=base_value_label,
+                        mine_label=mine_value_label,
+                        theirs_label=theirs_value_label,
+                        processed=item_id in self._difference_processed, conflict=conflict,
+                        base_value=base_value,
+                        mine_value=mine_value,
+                        theirs_value=theirs_value,
+                        source_side="base" if base_map else (
+                            "theirs" if is_three_way else "base"
+                        ),
+                        target_side="mine",
+                    ))
+        # A structural block has no single cell location; keep it in the same
+        # list so users can see why a sheet is not fully resolved.
+        projection = getattr(view, "column_comparison_cache", None)
+        structural = getattr(projection, "structural_diff_cols", ()) if projection is not None else ()
+        for logical_col in sorted(int(c) for c in (structural or ()) if int(c) > 0):
+            item_id = f"{view.sheet}:pair:-1:side:structure:kind:structure:row:0:col:{logical_col}"
+            items.append(DifferenceItem(
+                id=item_id, sheet=view.sheet, kind=DifferenceKind.STRUCTURE,
+                column=logical_col, summary=f"逻辑列 {get_column_letter(logical_col)} 存在结构变化",
+                role=self.role_presentation_for_view(
+                    view,
+                    direction="B2A" if is_three_way else "A2B",
+                ), processed=item_id in self._difference_processed,
+                base_label=base_value_label,
+                mine_label=mine_value_label,
+                theirs_label=theirs_value_label,
+            ))
+        return items
+
+    @staticmethod
+    def _value_from_parts(
+        parts,
+        physical_col: int | None,
+        logical_col: int,
+        *,
+        projection_known: bool = False,
+    ):
+        """Read one value from either a physical row tuple or a scalar.
+
+        Difference rows are a presentation model, not a second workbook
+        representation.  In particular, once a caller has resolved a value
+        to a scalar (including ``str``, ``int``, ``float`` or ``None``), it
+        must never be sent through ``len`` or indexed again.  Treat strings
+        and bytes as scalar cell values and only index concrete row
+        sequences.
+        """
+        if projection_known and physical_col is None:
+            # ``None`` is an authoritative missing-side mapping when a valid
+            # projection answered the lookup.  Never fall through to the
+            # adjacent logical column in that case.
+            return None
+        if parts is None:
+            return None
+        if isinstance(parts, (str, bytes, bytearray)):
+            return parts
+        if not isinstance(parts, Sequence):
+            return parts
+        try:
+            index = int(physical_col if physical_col is not None else logical_col) - 1
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or index >= len(parts):
+            return None
+        return parts[index]
+
+    @classmethod
+    def _logical_value_from_view(cls, view: "SheetView", pair_idx: int, logical_col: int, side: str, parts):
+        projection_known = False
+        try:
+            projection = view._active_column_projection()
+            if projection is None:
+                raise LookupError("column projection unavailable")
+            resolver = getattr(projection, "physical_col", None)
+            if not callable(resolver):
+                raise LookupError("column projection has no physical lookup")
+            physical = resolver(side, logical_col)
+            projection_known = True
+        except Exception:
+            physical = None
+        return cls._value_from_parts(
+            parts,
+            physical,
+            logical_col,
+            projection_known=projection_known,
+        )
+
+    @staticmethod
+    def _three_way_model_active_for_view(view: "SheetView") -> bool:
+        enabled = bool(getattr(view, "_is_three_way_enabled", lambda: False)())
+        if enabled:
+            return True
+        app = getattr(view, "app", None)
+        # A folded merge view still owns a complete Base-relative cache.  The
+        # browser must expose those structural rows even before the user
+        # expands the third pane.
+        return bool(
+            getattr(app, "merge_mode", False)
+            and getattr(app, "has_base", False)
+            and getattr(view, "pair_base_diff_cols", None)
+        )
+
+    @classmethod
+    def _logical_value_from_cache(cls, cache: dict, pair_idx: int, logical_col: int, side: str, parts):
+        projection_known = False
+        try:
+            projection = cache.get("column_comparison_cache")
+            if projection is None:
+                raise LookupError("column projection unavailable")
+            resolver = getattr(projection, "physical_col", None)
+            if not callable(resolver):
+                raise LookupError("column projection has no physical lookup")
+            physical = resolver(side, logical_col)
+            projection_known = True
+        except Exception:
+            physical = None
+        return cls._value_from_parts(
+            parts,
+            physical,
+            logical_col,
+            projection_known=projection_known,
+        )
+
+    @staticmethod
+    def _cache_pair_parts(cache: dict, name: str, pair_idx: int):
+        values = cache.get(name, {}) or {}
+        if not isinstance(values, dict):
+            return None
+        value = values.get(pair_idx)
+        if value is None and str(pair_idx) in values:
+            value = values.get(str(pair_idx))
+        return value
+
+    @staticmethod
+    def _view_pair_parts(view: "SheetView", name: str, pair_idx: int):
+        values = getattr(view, name, {}) or {}
+        if not isinstance(values, dict):
+            return None
+        value = values.get(pair_idx)
+        if value is None and str(pair_idx) in values:
+            value = values.get(str(pair_idx))
+        return value
+
+    def _difference_items_from_cache(self, cache: dict) -> list[DifferenceItem]:
+        """Project an unopened Sheet's background cache without creating Tk widgets."""
+        sheet = str(cache.get("sheet") or "")
+        pairs = list(cache.get("row_pairs") or ())
+        diff_map = cache.get("pair_diff_cols", {}) or {}
+        items: list[DifferenceItem] = []
+        presentation = RolePresentation.for_app(self)
+        is_three_way = bool(
+            getattr(self, "merge_mode", False) and getattr(self, "has_base", False)
+        )
+        base_value_label = presentation.middle if is_three_way else presentation.left
+        mine_value_label = presentation.left if is_three_way else presentation.right
+        theirs_value_label = presentation.right if is_three_way else "Theirs"
+        for raw_idx, cols in diff_map.items():
+            idx = int(raw_idx)
+            if not (0 <= idx < len(pairs)):
+                continue
+            ra, rb = pairs[idx]
+            row = ra or rb
+            base_kind = DifferenceKind.ADDED if ra is None else DifferenceKind.DELETED if rb is None else DifferenceKind.MODIFIED
+            if -1 in cols:
+                sentinel_row = row or idx + 1
+                sentinel_kind = DifferenceKind.ADDED if ra is None else DifferenceKind.DELETED
+                sentinel_id = f"{sheet}:pair:{idx}:side:B:kind:{sentinel_kind.value}:row:{sentinel_row}:sentinel"
+                items.append(DifferenceItem(
+                    id=sentinel_id, sheet=sheet, kind=sentinel_kind, row=sentinel_row,
+                    summary="目标侧缺失对应行", role=self.role_presentation_for_cache(
+                        "A2B" if not is_three_way else "B2A"
+                    ),
+                    base_label=base_value_label,
+                    mine_label=mine_value_label,
+                    theirs_label=theirs_value_label,
+                    processed=sentinel_id in self._difference_processed,
+                ))
+            for col in sorted(int(value) for value in cols if int(value) > 0):
+                conflict = bool(row and col in (getattr(self, "merge_conflict_cells_by_sheet", {}).get(sheet, {}).get(row, {}) or {}))
+                item_kind = DifferenceKind.CONFLICT if conflict else base_kind
+                item_id = f"{sheet}:pair:{idx}:side:B:kind:{item_kind.value}:row:{row or 0}:col:{col}"
+                # Keep scalar values (0, empty text, None) intact.  The
+                # logical resolver handles both row tuples and scalar values.
+                mine_value = self._cache_pair_parts(cache, "pair_parts_a", idx)
+                theirs_value = self._cache_pair_parts(cache, "pair_parts_b", idx)
+                base_value = self._cache_pair_parts(cache, "pair_parts_base", idx)
+                if is_three_way:
+                    display_base = self._logical_value_from_cache(cache, idx, col, "BASE", base_value)
+                    display_mine = self._logical_value_from_cache(cache, idx, col, "A", mine_value)
+                    display_theirs = self._logical_value_from_cache(cache, idx, col, "B", theirs_value)
+                else:
+                    display_base = self._logical_value_from_cache(cache, idx, col, "A", mine_value)
+                    display_mine = self._logical_value_from_cache(cache, idx, col, "B", theirs_value)
+                    display_theirs = None
+                items.append(DifferenceItem(
+                    id=item_id, sheet=sheet, kind=item_kind, row=row, column=col,
+                    summary=f"逻辑列 {get_column_letter(col)} 的值或公式不同",
+                    role=self.role_presentation_for_cache(
+                        "B2A" if is_three_way else "A2B"
+                    ), processed=item_id in self._difference_processed, conflict=conflict,
+                    base_label=base_value_label,
+                    mine_label=mine_value_label,
+                    theirs_label=theirs_value_label,
+                    base_value=display_base, mine_value=display_mine, theirs_value=display_theirs,
+                    source_side="theirs" if is_three_way else "base",
+                    target_side="mine",
+                ))
+        projection = cache.get("column_comparison_cache")
+        for raw_idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items():
+            idx = int(raw_idx)
+            if not (0 <= idx < len(pairs)):
+                continue
+            ra, rb = pairs[idx]
+            row = ra or rb or idx + 1
+            for col in sorted(int(value) for value in cols if int(value) > 0):
+                item_id = f"{sheet}:pair:{idx}:side:BASE:kind:modified:row:{row}:col:{col}"
+                base_parts = self._cache_pair_parts(cache, "pair_parts_base", idx)
+                mine_parts = self._cache_pair_parts(cache, "pair_parts_a", idx)
+                items.append(DifferenceItem(
+                    id=item_id, sheet=sheet, kind=DifferenceKind.MODIFIED, row=row, column=col,
+                    summary=f"逻辑列 {get_column_letter(col)} 的 Mine/Base 值或公式不同",
+                    role=self.role_presentation_for_cache("BASE2A"), processed=item_id in self._difference_processed,
+                    base_label=base_value_label,
+                    mine_label=mine_value_label,
+                    theirs_label=theirs_value_label,
+                    base_value=self._logical_value_from_cache(cache, idx, col, "BASE", base_parts),
+                    mine_value=self._logical_value_from_cache(cache, idx, col, "A", mine_parts),
+                    theirs_value=self._logical_value_from_cache(
+                        cache, idx, col, "B", self._cache_pair_parts(cache, "pair_parts_b", idx)
+                    ),
+                    source_side="base", target_side="mine",
+                ))
+        for col in sorted(int(value) for value in getattr(projection, "structural_diff_cols", ()) if int(value) > 0):
+            item_id = f"{sheet}:pair:-1:side:structure:kind:structure:row:0:col:{col}"
+            items.append(DifferenceItem(
+                id=item_id, sheet=sheet, kind=DifferenceKind.STRUCTURE, column=col,
+                summary=f"逻辑列 {get_column_letter(col)} 存在结构变化", role=self.role_presentation_for_cache(
+                    "B2A" if is_three_way else "A2B"
+                ),
+                processed=item_id in self._difference_processed,
+                base_label=base_value_label,
+                mine_label=mine_value_label,
+                theirs_label=theirs_value_label,
+            ))
+        for raw_idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items():
+            if -1 not in cols:
+                continue
+            idx = int(raw_idx)
+            if not (0 <= idx < len(pairs)):
+                continue
+            ra, rb = pairs[idx]
+            base_row = (cache.get("pair_base_row_override", {}) or {}).get(idx)
+            if base_row is None:
+                base_row = (cache.get("pair_base_row_override", {}) or {}).get(str(idx))
+            if base_row is None and ra is not None:
+                base_row = (cache.get("mine_to_base_row", {}) or {}).get(ra)
+                if base_row is None:
+                    base_row = (cache.get("mine_to_base_row", {}) or {}).get(str(ra))
+            if base_row is None and rb is not None:
+                base_row = (cache.get("theirs_to_base_row", {}) or {}).get(rb)
+                if base_row is None:
+                    base_row = (cache.get("theirs_to_base_row", {}) or {}).get(str(rb))
+            row = ra or rb or base_row or idx + 1
+            if base_row is None and ra is not None and rb is not None:
+                kind, summary = DifferenceKind.ADDED, "Mine 与 Theirs 共同新增行"
+            elif base_row is not None and ra is None and rb is None:
+                kind, summary = DifferenceKind.DELETED, "Mine 与 Theirs 共同删除行"
+            else:
+                kind, summary = DifferenceKind.DELETED, "Base-only 行：Mine 与 Theirs 均无对应行"
+            item_id = f"{sheet}:pair:{idx}:side:BASE:kind:{kind.value}:row:{row}:sentinel"
+            items.append(DifferenceItem(
+                id=item_id, sheet=sheet, kind=kind, row=row,
+                summary=summary, role=self.role_presentation_for_cache(
+                    "BASE2A" if is_three_way else "A2B"
+                ),
+                base_label=base_value_label,
+                mine_label=mine_value_label,
+                theirs_label=theirs_value_label,
+                processed=item_id in self._difference_processed,
+            ))
+        return items
+
+    def role_presentation_for_cache(self, direction: str | None = None) -> str:
+        presentation = RolePresentation.for_app(self)
+        if direction is None:
+            direction = "B2A" if getattr(self, "merge_mode", False) else "A2B"
+        return presentation.action_label(direction)
+
+    def role_presentation_for_view(
+        self,
+        view: "SheetView",
+        logical_col: int = 0,
+        *,
+        direction: str | None = None,
+    ) -> str:
+        try:
+            presentation = getattr(view, "role_presentation", RolePresentation.for_app(self))
+            if direction is None:
+                direction = "B2A" if getattr(self, "merge_mode", False) else "A2B"
+            return presentation.action_label(direction)
+        except Exception:
+            return self.role_presentation_for_cache(direction)
+
+    def refresh_difference_browser(self) -> None:
+        if self._diff_browser is None:
+            return
+        items: list[DifferenceItem] = []
+        loaded_sheets = set()
+        for view in getattr(self, "sheet_views", {}).values():
+            if view is not None and getattr(view, "_data_ready", False):
+                items.extend(self._difference_items_from_view(view))
+                loaded_sheets.add(view.sheet)
+        for sheet, cache in getattr(self, "_sheet_cache_store", {}).items():
+            if sheet not in loaded_sheets:
+                items.extend(self._difference_items_from_cache(cache))
+        self.difference_items = tuple({item.id: item for item in items}.values())
+        counts: dict[str, int] = {}
+        for item in self.difference_items:
+            counts[item.sheet] = counts.get(item.sheet, 0) + (0 if item.processed else 1)
+        self.sheet_diff_counts = counts
+        self._diff_browser.set_items(items)
+        self.refresh_sheet_nav()
+        self._refresh_command_widgets()
+
+    def _persist_difference_browser_layout(self, height: int, collapsed: bool) -> None:
+        settings = getattr(self, "settings", None)
+        if not isinstance(settings, dict):
+            return
+        settings["difference_browser_height"] = max(90, min(460, int(height)))
+        settings["difference_browser_collapsed"] = bool(collapsed)
+
+    def _persist_difference_browser_preferences(self) -> None:
+        if self._diff_browser is None:
+            return
+        settings = getattr(self, "settings", {})
+        settings["difference_browser_query"] = self._diff_browser.query_var.get()
+        settings["difference_browser_unprocessed"] = bool(self._diff_browser.unprocessed_var.get())
+        settings["difference_browser_conflicts"] = bool(self._diff_browser.conflicts_var.get())
+
+    def get_difference_items(self, limit: int = 500) -> tuple[DifferenceItem, ...]:
+        """Return a bounded snapshot suitable for tests, diagnostics or plugins."""
+        self.refresh_difference_browser()
+        return tuple(self.difference_items[: max(0, int(limit))])
+
+    def mark_difference_processed(self, item_id: str, processed: bool = True) -> None:
+        """Incrementally update the browser after an explicit merge action."""
+        key = str(item_id)
+        keys = {key}
+        if ":structure:" in key:
+            col = key.rsplit(":", 1)[-1]
+            # Persist the canonical browser ID even when a structural action
+            # completes before the first difference-browser snapshot exists.
+            # The next cache refresh can then restore the processed badge
+            # without relying on the legacy short alias.
+            if col.isdigit() and ":pair:" not in key:
+                sheet = key.split(":structure:", 1)[0]
+                keys.add(
+                    f"{sheet}:pair:-1:side:structure:kind:structure:row:0:col:{col}"
+                )
+            if ":pair:" not in key:
+                sheet = key.split(":structure:", 1)[0]
+                keys.update(
+                    item.id
+                    for item in self.difference_items
+                    if item.sheet == sheet
+                    and item.kind == DifferenceKind.STRUCTURE
+                    and item.id.endswith(f":col:{col}")
+                )
+        for stable_key in keys:
+            if processed:
+                self._difference_processed.add(stable_key)
+            else:
+                self._difference_processed.discard(stable_key)
+        if self._diff_browser is not None:
+            self._diff_browser.mark_processed(key, processed)
+
+    def mark_structure_difference_processed(
+        self, sheet: str, logical_col: int, processed: bool = True
+    ) -> None:
+        """Mark the real structural DifferenceItem IDs for a column action.
+
+        Structural operations can span one or more physical columns, while
+        the browser exposes a stable logical-column item.  Resolve those IDs
+        from the current read-only view model first; retain the old compact
+        alias only as a compatibility fallback for callers with no browser
+        snapshot yet.
+        """
+        sheet = str(sheet)
+        logical_col = int(logical_col)
+        matches = [
+            item.id
+            for item in getattr(self, "difference_items", ())
+            if item.sheet == sheet
+            and item.kind == DifferenceKind.STRUCTURE
+            and int(item.column or 0) == logical_col
+        ]
+        if matches:
+            for item_id in matches:
+                self.mark_difference_processed(item_id, processed)
+            return
+        self.mark_difference_processed(f"{sheet}:structure:{logical_col}", processed)
+
+    def mark_difference_items_processed(
+        self, item_ids: Iterable[str], processed: bool = True
+    ) -> tuple[str, ...]:
+        """Batch-update browser state once for a retain/global acknowledgement."""
+        ids = tuple(dict.fromkeys(str(item_id) for item_id in (item_ids or ()) if item_id))
+        if not ids:
+            return ()
+        for item_id in ids:
+            if processed:
+                self._difference_processed.add(item_id)
+            else:
+                self._difference_processed.discard(item_id)
+        browser = getattr(self, "_diff_browser", None)
+        if browser is not None:
+            try:
+                for item_id in ids:
+                    browser.index.update(item_id, processed=processed)
+                selected = browser.tree.selection()[0] if browser.tree.selection() else None
+                browser.render()
+                if selected and selected in getattr(browser, "_rendered", {}):
+                    browser.tree.selection_set(selected)
+                    browser.tree.focus(selected)
+            except Exception:
+                pass
+        return ids
+
+    def mark_difference_pair_processed(
+        self,
+        sheet: str,
+        pair_idx: int,
+        columns: Iterable[int] | None = None,
+        processed: bool = True,
+    ) -> tuple[str, ...]:
+        """Mark the stable DifferenceItem IDs belonging to one aligned pair."""
+        sheet = str(sheet)
+        pair_idx = int(pair_idx)
+        requested = tuple(int(value) for value in (columns or ()))
+        wanted = {value for value in requested if value > 0}
+        matches = []
+        for item in getattr(self, "difference_items", ()):
+            if item.sheet != sheet or f":pair:{pair_idx}:" not in item.id:
+                continue
+            if requested:
+                if item.column is None:
+                    if -1 not in requested:
+                        continue
+                elif int(item.column) not in wanted:
+                    continue
+            matches.append(item.id)
+        return self.mark_difference_items_processed(matches, processed)
+
+    def mark_difference_row_processed(
+        self, sheet: str, row: int, processed: bool = True
+    ) -> tuple[str, ...]:
+        """Mark all real DifferenceItems on one row and return their IDs.
+
+        The row alias predates pair-based IDs and remains a compatibility
+        fallback for callers that cannot resolve a current pair.  Returning
+        the concrete IDs is essential for compound/region retain actions:
+        their undo entry must carry the same stable IDs that were actually
+        marked, rather than an empty legacy return value.
+        """
+        sheet = str(sheet)
+        row = int(row)
+        prefix = f"{sheet}:row:{row}:"
+        matches = tuple(
+            dict.fromkeys(
+                str(item.id)
+                for item in self.difference_items
+                if item.id.startswith(prefix)
+                or (item.sheet == sheet and item.row == row)
+            )
+        )
+        for item_id in matches:
+            self.mark_difference_processed(item_id, processed)
+        self.refresh_difference_browser()
+        return matches
+
+    def command_state(self) -> CommandState:
+        """Return one authoritative snapshot for toolbar enablement."""
+        view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
+        vcs_two_way = self._is_vcs_two_way_mode()
+        unsaved = (
+            bool(getattr(self, "modified_b", False))
+            if vcs_two_way
+            else bool(getattr(self, "modified_a", False) or getattr(self, "modified_b", False))
+        )
+        return CommandState(
+            busy=bool(getattr(self, "_is_closing", False) or getattr(self, "_interactive_action_event", threading.Event()).is_set()),
+            ready=bool(view is not None and getattr(view, "_data_ready", False)),
+            has_selection=bool(view is not None and getattr(view, "selected_pair_idx", None) is not None),
+            has_unsaved_changes=unsaved,
+            has_conflicts=bool(getattr(self, "merge_conflict_cells_by_sheet", {})),
+            can_save=bool(getattr(self, "merged_path", None) or unsaved),
+            can_undo=bool(getattr(self, "undo_stack", [])),
+        )
+
+    def _refresh_command_widgets(self) -> None:
+        state = self.command_state()
+        mapping = {
+            "top_prev_btn": "previous", "top_next_btn": "next", "top_search_btn": "search",
+            "top_filter_btn": "filter", "top_apply_btn": "apply_source", "top_retain_btn": "retain",
+            "top_base_btn": "base", "top_undo_btn": "undo", "primary_save_btn": "save_merged",
+            "top_save_as_btn": "save_as",
+        }
+        for name, command in mapping.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                enabled = state.enabled(command)
+                # Retaining Mine is only a three-way conflict acknowledgement;
+                # it is not a valid two-way command.  Likewise, VCS two-way
+                # comparisons protect the A/Base temporary copy from any
+                # reverse-direction action.
+                if name == "top_retain_btn" and not (
+                    getattr(self, "merge_mode", False)
+                    and getattr(self, "has_base", False)
+                ):
+                    enabled = False
+                widget.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+    def _on_difference_selected(self, item: DifferenceItem) -> None:
+        # Keep the browser's stable identity attached to the loaded view so a
+        # subsequent structural/row action and its undo can update exactly
+        # that item instead of rebuilding a location-based approximation.
+        view = getattr(self, "sheet_views", {}).get(item.sheet)
+        if view is not None:
+            try:
+                view._selected_difference_item_id = item.id
+            except Exception:
+                pass
+            # Structural/synthetic rows (for example a Base-only row deleted
+            # by both sides) have no physical Mine/Theirs row number.  Their
+            # stable DifferenceItem ID still carries the exact aligned pair;
+            # use that pair for navigation before falling back to a raw Excel
+            # row lookup.
+            match = re.search(r":pair:(\d+):", str(item.id or ""))
+            if match:
+                try:
+                    pair_idx = int(match.group(1))
+                    if view._materialize_pair_for_navigation(pair_idx):
+                        line = view.row_to_line.get(pair_idx)
+                        if line is not None:
+                            view._goto_block_start(int(line))
+                            view._set_main_selected_cell(int(line), int(item.column or 1))
+                            view.selected_pair_idx = pair_idx
+                            view._update_cursor_lines()
+                            view._update_diff_nav_state()
+                            return
+                except Exception:
+                    pass
+        if item.row is None:
+            return
+        self._navigate_to_conflict_cell(item.sheet, int(item.row), int(item.column or 1))
 
     def set_sheet_has_diff(self, sheet: str, has: bool, confirmed: bool = True):
         # Keep API: mark sheet diff state
@@ -32424,6 +33950,42 @@ class SowMergeApp:
         self._focus_save_merged_action()
         return "save"
 
+    def _show_compare_settings(self):
+        messagebox.showinfo("比较设置", "当前比较会优先使用 SVN/右键传入的文件身份与 Sheet 配对；\n如需自定义唯一键或列映射，请在当前 Sheet 的列结构标记处确认。", parent=self.root)
+
+    def _save_as_result(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="另存为", defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx *.xlsm")],
+        )
+        if not path:
+            return
+        try:
+            self._ensure_edit_loaded()
+            if self.merge_mode and self.merged_path:
+                source = self.build_manual_merge_output_file()
+                shutil.copy2(source, path)
+                try: os.remove(source)
+                except OSError: pass
+            else:
+                self._atomic_save(self._wb_b_edit, path)
+            messagebox.showinfo("另存为成功", f"已写入：\n{path}", parent=self.root)
+        except Exception as exc:
+            messagebox.showerror("另存为失败", str(exc), parent=self.root)
+
+    def _save_primary_result(self):
+        if self.merge_mode and self.merged_path:
+            return self.save_merged_and_exit()
+        # A TortoiseSVN two-way invocation is Base(A) -> Mine(B).  A is a
+        # temporary read-only projection; the primary output command must
+        # always save the real working file, even if a stale callback left an
+        # accidental A-side dirty flag behind.
+        if self._is_vcs_two_way_mode():
+            return self.save_b_inplace()
+        if getattr(self, "modified_a", False):
+            return self.save_a_inplace()
+        return self.save_b_inplace()
+
     def _build_ui(self):
         tk.Frame(self.root, height=4, bg=self.workspace_chrome_color, bd=0, highlightthickness=0).pack(fill="x")
         top = ttk.Frame(self.root, style="MergeChrome.TFrame")
@@ -32449,17 +34011,64 @@ class SowMergeApp:
         ).pack(anchor="w", pady=(1, 0))
         actions = ttk.Frame(top, style="MergeChrome.TFrame")
         actions.grid(row=0, column=1, sticky="e", padx=(18, 0))
+        # Keep the command surface grouped like mature comparison tools while
+        # retaining the existing command callbacks and safety gates.
+        self.command_group_labels = []
+        def _command_group(title: str):
+            group = ttk.LabelFrame(actions, text=title, padding=(4, 1), style="Workspace.Status.TFrame")
+            group.pack(side="left", padx=(4, 0))
+            self.command_group_labels.append(group)
+            return group
+        compare_group = _command_group("比较")
+        navigation_group = _command_group("导航")
+        process_group = _command_group("处理")
+        output_group = _command_group("输出")
+        current_view = lambda: self.sheet_views.get(getattr(self, "selected_sheet", ""))
+        def _view_action(name: str, *args):
+            view = current_view()
+            callback = getattr(view, name, None) if view is not None else None
+            if callable(callback):
+                return callback(*args)
+            return None
         self.recalc_btn = ttk.Button(
-            actions,
+            compare_group,
             text="重算并刷新",
             style="Primary.TButton",
             command=self.recalc_and_refresh,
         )
-        self.recalc_btn.pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="导出诊断包", style="App.TButton", command=self.export_diagnostic_bundle).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="复制反馈信息", style="App.TButton", command=self.copy_feedback_info).pack(side="left", padx=(0, 8))
-        self.update_btn = ttk.Button(actions, text="检查更新", command=self._do_svn_update)
-        self.update_btn.pack(side="left")
+        self.recalc_btn.pack(side="left")
+        ttk.Button(compare_group, text="比较设置", command=self._show_compare_settings).pack(side="left", padx=(4, 0))
+        self.top_prev_btn = ttk.Button(navigation_group, text="上一差异", command=lambda: _view_action("_goto_prev_diff_block")); self.top_prev_btn.pack(side="left")
+        self.top_next_btn = ttk.Button(navigation_group, text="下一差异", command=lambda: _view_action("_goto_next_diff_block")); self.top_next_btn.pack(side="left", padx=(2, 0))
+        self.top_search_btn = ttk.Button(navigation_group, text="搜索", command=lambda: self._diff_browser.query_entry.focus_set() if self._diff_browser is not None else None); self.top_search_btn.pack(side="left", padx=(2, 0))
+        self.top_filter_btn = ttk.Button(navigation_group, text="筛选", command=lambda: self._diff_browser.toggle_unprocessed_filter() if self._diff_browser is not None else None); self.top_filter_btn.pack(side="left", padx=(2, 0))
+        top_apply_direction = "B2A" if (self.merge_mode and self.has_base) else "A2B"
+        role_presentation = RolePresentation.for_app(self)
+        top_apply_label = role_presentation.action_label(top_apply_direction)
+        top_retain_label = role_presentation.action_label("MINE2A")
+        self.top_apply_btn = ttk.Button(process_group, text=top_apply_label, command=lambda: _view_action("_run_copy_action_by_mode", top_apply_direction)); self.top_apply_btn.pack(side="left")
+        self.top_retain_btn = ttk.Button(process_group, text=top_retain_label, command=lambda: _view_action("_run_copy_action_by_mode", "MINE2A")); self.top_retain_btn.pack(side="left", padx=(2, 0))
+        if self.merge_mode and self.has_base:
+            self.top_base_btn = ttk.Button(process_group, text=role_presentation.action_label("BASE2A"), command=lambda: _view_action("_run_copy_action_by_mode", "BASE2A")); self.top_base_btn.pack(side="left", padx=(2, 0))
+        else:
+            self.top_base_btn = None
+        self.top_undo_btn = ttk.Button(process_group, text="撤销", command=lambda: _view_action("_undo_last_action")); self.top_undo_btn.pack(side="left", padx=(2, 0))
+        self.primary_save_btn = ttk.Button(
+            output_group,
+            text="保存合并结果" if self.merge_mode else "保存工作文件",
+            style="Primary.TButton",
+            command=self._save_primary_result,
+        )
+        self.primary_save_btn.pack(side="left")
+        self.top_save_as_btn = ttk.Button(output_group, text="另存为", command=self._save_as_result); self.top_save_as_btn.pack(side="left", padx=(4, 0))
+        self.update_btn = None
+        self.more_menu = tk.Menubutton(actions, text="更多…", relief="flat", padx=8)
+        self.more_menu.pack(side="left")
+        self.more_menu_model = tk.Menu(self.more_menu, tearoff=False)
+        self.more_menu_model.add_command(label="导出诊断包", command=self.export_diagnostic_bundle)
+        self.more_menu_model.add_command(label="复制反馈信息", command=self.copy_feedback_info)
+        self.more_menu_model.add_command(label="检查更新", command=self._do_svn_update)
+        self.more_menu.configure(menu=self.more_menu_model)
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 2))
 
@@ -32521,6 +34130,22 @@ class SowMergeApp:
         self.nav_inner = ttk.Frame(self.nav_canvas, style="MergeChrome.TFrame")
         self.nav_canvas.create_window((0, 0), window=self.nav_inner, anchor="nw")
         self.nav_inner.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
+        # Commercial-compare-inspired cache-backed difference browser.  It is a dock,
+        # not a second navigation system: Sheet strip remains the sole host
+        # navigator and selecting a row only locates the corresponding cell.
+        browser_settings = getattr(self, "settings", {}) or {}
+        self._diff_browser = DifferenceBrowser(
+            self.root,
+            on_select=self._on_difference_selected,
+            height=int(browser_settings.get("difference_browser_height", 150) or 150),
+            on_resize=self._persist_difference_browser_layout,
+        )
+        self._diff_browser.query_var.set(str(browser_settings.get("difference_browser_query", "") or ""))
+        self._diff_browser.unprocessed_var.set(bool(browser_settings.get("difference_browser_unprocessed", False)))
+        self._diff_browser.conflicts_var.set(bool(browser_settings.get("difference_browser_conflicts", False)))
+        if bool(browser_settings.get("difference_browser_collapsed", False)):
+            self._diff_browser.toggle()
+        self._diff_browser.frame.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         self.nb.pack(side="top", fill="both", expand=True, padx=10, pady=(2, 2))
 
         # Tabs are created up-front, but heavy SheetView is created lazily on first activation.
@@ -33188,7 +34813,14 @@ class SowMergeApp:
                     ws_b,
                     max_col,
                 )
-                pair_base_row_override = _build_pair_base_row_overrides(
+                row_pairs, synthetic_base_rows = _augment_three_way_row_pairs_with_base_deletions(
+                    row_pairs,
+                    mine_to_base_row,
+                    theirs_to_base_row,
+                    max_r_base,
+                )
+                pair_base_row_override = dict(synthetic_base_rows)
+                pair_base_row_override.update(_build_pair_base_row_overrides(
                     row_pairs,
                     mine_to_base_row,
                     theirs_to_base_row,
@@ -33196,7 +34828,7 @@ class SowMergeApp:
                     ws_a,
                     ws_b,
                     max_col,
-                )
+                ))
                 _check_bg_cancel()
 
             for idx, (ra, rb) in enumerate(row_pairs):
@@ -33416,7 +35048,10 @@ class SowMergeApp:
                         base_row = base_row_by_pair.get(idx)
                         if base_row is None:
                             pair_parts_base[idx] = []
-                            if ra is not None:
+                            # A Base-missing row is an addition on Mine and/or
+                            # Theirs.  The explicit sentinel is also needed
+                            # when both sides carry the same newly-added row.
+                            if ra is not None or rb is not None:
                                 pair_base_diff_cols[idx] = {-1}
                         else:
                             row_base_vals = _row_from_cache(
@@ -33428,7 +35063,13 @@ class SowMergeApp:
                             pair_parts_base[idx] = [
                                 _val_to_str(value) for value in row_base_vals
                             ]
-                            if ra is not None:
+                            if ra is None:
+                                # Base-only rows are represented by a
+                                # synthetic (None, None) pair or by a
+                                # one-sided Mine deletion.  Both are true
+                                # Base-relative structural differences.
+                                pair_base_diff_cols[idx] = {-1}
+                            else:
                                 base_comparison = compare_logical_row_sides(
                                     column_comparison_cache,
                                     row_a_vals,
@@ -33502,9 +35143,11 @@ class SowMergeApp:
                                 width = min(len(base_text), _COL_MAX_DISPLAY_WIDTH)
                                 if width > col_char_widths.get(c, 0):
                                     col_char_widths[c] = width
-                        if ra is not None and base_row is None:
+                        if base_row is None and ra is not None and rb is not None:
                             pair_base_diff_cols[idx] = {-1}
-                        elif ra is not None:
+                        elif base_row is not None and ra is None:
+                            pair_base_diff_cols[idx] = {-1}
+                        elif base_row is not None:
                             row_base_edit = _row_from_cache(rows_base_edit, base_row, max_col)
                             base_comparison = compare_logical_row_sides(
                                 column_comparison_cache,
@@ -33638,6 +35281,7 @@ class SowMergeApp:
                 self._sheet_cache_store[sheet] = cache
                 self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
                 self.refresh_sheet_nav()
+                self.refresh_difference_browser()
                 return
             if getattr(view, "_suppress_bg_apply", False):
                 _dlog(f"skip bg cache apply by user action: sheet={sheet}")
@@ -33864,6 +35508,7 @@ class SowMergeApp:
                 view._start_async_large_only_diff_build()
             view._refresh_interaction_gate()
             self.refresh_sheet_nav()
+            self.refresh_difference_browser()
             # The first useful Sheet is now visible.  Let editable-workbook
             # preload begin while unopened-tab scans yield via
             # _edit_preload_active_event.
@@ -33909,7 +35554,7 @@ class SowMergeApp:
                     if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
                         wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
                     wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
-                    wb_b_e = load_workbook(self.file_b, data_only=False, read_only=True)
+                    wb_b_e = load_workbook(self._mine_working_path(), data_only=False, read_only=True)
                     if getattr(self, "has_base", False) and getattr(self, "base_path", None):
                         wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
                 except Exception as e:
@@ -34164,6 +35809,7 @@ class SowMergeApp:
         _on_tab_changed()
 
         self.refresh_sheet_nav()
+        self._refresh_command_widgets()
 
         # Stage-1 tab coloring is provisional. Stage-2 exact background compute
         # changes state 1 (pale) to state 2 (bright) or clears it to state 0.
@@ -34454,6 +36100,7 @@ class SowMergeApp:
                 tuple(self.display_sheets),
                 tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in self.display_sheets),
                 tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in self.display_sheets),
+                tuple((s, int(getattr(self, "sheet_diff_counts", {}).get(s, 0))) for s in self.display_sheets),
                 getattr(self, "selected_sheet", None),
                 getattr(
                     getattr(self, "_only_diff_progress_owner", (None,))[0]
@@ -34469,9 +36116,20 @@ class SowMergeApp:
                 and self.nav_inner.winfo_children():
             return
         self._nav_sig = nav_sig
-
-        for child in list(self.nav_inner.winfo_children()):
-            child.destroy()
+        try:
+            nav_x = float(self.nav_canvas.xview()[0])
+        except Exception:
+            nav_x = 0.0
+        nav_buttons = getattr(self, "_nav_buttons", {})
+        desired = set(self.display_sheets)
+        for old_sheet, old_button in list(nav_buttons.items()):
+            if old_sheet not in desired:
+                try:
+                    old_button.destroy()
+                except Exception:
+                    pass
+                nav_buttons.pop(old_sheet, None)
+        self._nav_buttons = nav_buttons
 
         try:
             from tkinter import font as tkfont
@@ -34497,11 +36155,13 @@ class SowMergeApp:
             is_selected = (tab_text == getattr(self, "selected_sheet", None))
             if is_selected:
                 bg = "#D9D9D9"
-            b = tk.Button(self.nav_inner, text=label,
-                          relief="sunken" if is_selected else "groove",
-                          bd=2 if is_selected else 1,
-                          padx=8, pady=2, bg=bg,
-                          command=lambda: self._select_tab(tab_text))
+            b = nav_buttons.get(tab_text)
+            if b is None or not b.winfo_exists():
+                b = tk.Button(self.nav_inner, command=lambda: self._select_tab(tab_text))
+                b.pack(side="left", padx=4)
+                nav_buttons[tab_text] = b
+            b.configure(text=label, relief="sunken" if is_selected else "groove",
+                        bd=2 if is_selected else 1, padx=8, pady=2, bg=bg)
             progress_owner = getattr(self, "_only_diff_progress_owner", None)
             if progress_owner is not None and tab_text != getattr(
                 progress_owner[0],
@@ -34509,6 +36169,8 @@ class SowMergeApp:
                 None,
             ):
                 b.configure(state="disabled")
+            else:
+                b.configure(state="normal")
             try:
                 if is_selected and self._nav_font_bold:
                     b.configure(font=self._nav_font_bold)
@@ -34516,16 +36178,27 @@ class SowMergeApp:
                     b.configure(font=self._nav_font)
             except Exception:
                 pass
-            b.pack(side="left", padx=4)
-
         for s in self.display_sheets:
             meta = self.get_sheet_meta(s)
             kind = "missing" if meta.get("view_mode") == "missing_sheet" else "common"
-            add_btn(s, s, kind, state=int(self.sheet_diff_state.get(s, 0)))
+            state = int(self.sheet_diff_state.get(s, 0))
+            count = int(getattr(self, "sheet_diff_counts", {}).get(s, 0))
+            if kind == "missing":
+                label = f"⊘ {s} · 缺失"
+            elif state >= 2:
+                label = f"● {s} · 已确认" + (f" ({count})" if count else "")
+            elif state == 1:
+                label = f"◐ {s} · 待确认" + (f" ({count})" if count else "")
+            else:
+                label = f"○ {s} · 无差异"
+            add_btn(label, s, kind, state=state)
 
         self.nav_canvas.update_idletasks()
         self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
-
+        try:
+            self.nav_canvas.xview_moveto(nav_x)
+        except Exception:
+            pass
     def open_textdiff(self):
         try:
             temp_root = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Temp", "TortoiseXlsTemp")
@@ -35049,7 +36722,7 @@ class SowMergeApp:
 
         def _do_recalc():
             new_a = _maybe_recalc_and_prepare_val_path(self.file_a, force=True)
-            new_b = _maybe_recalc_and_prepare_val_path(self.file_b, force=True)
+            new_b = _maybe_recalc_and_prepare_val_path(self._mine_working_path(), force=True)
             new_base = _maybe_recalc_and_prepare_val_path(self.base_path, force=True) if getattr(self, "has_base", False) else None
             self._apply_recalc_results(new_a=new_a, new_b=new_b, new_base=new_base)
 
@@ -35071,7 +36744,7 @@ class SowMergeApp:
         def _worker():
             try:
                 new_a = _maybe_recalc_and_prepare_val_path(self.file_a)
-                new_b = _maybe_recalc_and_prepare_val_path(self.file_b)
+                new_b = _maybe_recalc_and_prepare_val_path(self._mine_working_path())
                 new_base = _maybe_recalc_and_prepare_val_path(self.base_path) if getattr(self, "has_base", False) else None
             except Exception:
                 new_a = None
@@ -35117,7 +36790,6 @@ class SowMergeApp:
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(False, False)
-        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
         dlg.geometry("+{}+{}".format(self.root.winfo_rootx() + 200, self.root.winfo_rooty() + 150))
         message_label = ttk.Label(dlg, text=message, padding=(12, 12, 12, 4), wraplength=520)
         message_label.pack(fill="x")
@@ -35129,6 +36801,26 @@ class SowMergeApp:
             wraplength=520,
         )
         detail_label.pack(fill="x")
+        def _reject_progress_close():
+            try:
+                detail_label.configure(text="任务进行中，完成前不能关闭此窗口…")
+                self.root.bell()
+            except tk.TclError:
+                pass
+
+        def _destroy_progress_dialog():
+            try:
+                if dlg.winfo_exists():
+                    try:
+                        if dlg.grab_current() == dlg:
+                            dlg.grab_release()
+                    except tk.TclError:
+                        pass
+                    dlg.destroy()
+            except tk.TclError:
+                pass
+
+        dlg.protocol("WM_DELETE_WINDOW", _reject_progress_close)
         pb = ttk.Progressbar(dlg, mode="indeterminate")
         pb.pack(fill="x", padx=12, pady=(0, 6))
         elapsed_label = ttk.Label(dlg, text="已用时 0.0 秒", foreground="#777", padding=(12, 0, 12, 10))
@@ -35143,9 +36835,9 @@ class SowMergeApp:
             finally:
                 try:
                     pb.stop()
-                    dlg.destroy()
-                except Exception:
+                except tk.TclError:
                     pass
+                _destroy_progress_dialog()
                 self._end_interactive_action()
 
         updates_lock = threading.Lock()
@@ -35184,10 +36876,7 @@ class SowMergeApp:
             if gc_was_enabled:
                 gc.enable()
                 gc.collect()
-            try:
-                dlg.destroy()
-            except Exception:
-                pass
+            _destroy_progress_dialog()
             self._end_interactive_action()
             raise RuntimeError("任务未能启动：应用正在关闭")
 
@@ -35197,22 +36886,25 @@ class SowMergeApp:
                 if updates:
                     latest = updates[-1]
                     updates.clear()
-            if latest is not None:
-                text_value, detail_value, percent_value = latest
-                if text_value:
-                    message_label.configure(text=str(text_value))
-                if detail_value is not None:
-                    detail_label.configure(text=str(detail_value))
-                if percent_value is not None:
-                    pb.stop()
-                    pb.configure(mode="determinate", maximum=100, value=percent_value)
-            elapsed_label.configure(text=f"已用时 {time.monotonic() - started:.1f} 秒")
+            try:
+                if latest is not None:
+                    text_value, detail_value, percent_value = latest
+                    if text_value:
+                        message_label.configure(text=str(text_value))
+                    if detail_value is not None:
+                        detail_label.configure(text=str(detail_value))
+                    if percent_value is not None:
+                        pb.stop()
+                        pb.configure(mode="determinate", maximum=100, value=percent_value)
+                elapsed_label.configure(text=f"已用时 {time.monotonic() - started:.1f} 秒")
+            except tk.TclError:
+                return
             if done.is_set():
                 try:
                     pb.stop()
-                    dlg.destroy()
-                except Exception:
+                except tk.TclError:
                     pass
+                _destroy_progress_dialog()
                 return
             try:
                 dlg.after(80, _poll)
@@ -35225,8 +36917,9 @@ class SowMergeApp:
         finally:
             try:
                 pb.stop()
-            except Exception:
+            except tk.TclError:
                 pass
+            _destroy_progress_dialog()
             if gc_was_enabled:
                 gc.enable()
                 gc.collect()
@@ -35630,7 +37323,7 @@ class SowMergeApp:
         except Exception as exc:
             messagebox.showerror("保存已停止", str(exc))
             return
-        path = self.file_b
+        path = self._mine_working_path()
         if not self._confirm_overwrite("B", path):
             return
         try:
@@ -35675,6 +37368,15 @@ class SowMergeApp:
             messagebox.showerror("保存失败", f"保存 B 失败：\n{e}")
 
     def save_a_inplace(self):
+        if self._is_vcs_two_way_mode():
+            notice = getattr(self, "show_nonblocking_notice", None)
+            if callable(notice):
+                notice(
+                    "VCS 两方模式中 Base 仅用于对比，不能保存或覆盖 Base；请保存 Mine 工作文件。",
+                    warning=True,
+                    duration_ms=6000,
+                )
+            return False
         if not self._guard_save_readiness("保存 A", "A"):
             return
         self._ensure_edit_loaded()

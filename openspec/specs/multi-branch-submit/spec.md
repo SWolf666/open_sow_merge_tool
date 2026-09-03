@@ -94,3 +94,18 @@
 
 - **WHEN** the current user runs the dedicated context-menu uninstaller
 - **THEN** only the three owned `SowMultiBranchSVNSubmit` shell trees are removed and other Explorer or TortoiseSVN settings remain untouched
+
+## Scenario: target-free mode is native commit
+
+- **WHEN** no target branch is selected
+- **THEN** the workbench shows “源分支单提交” and “SVN 单分支提交”, skips multi-branch preflight and opens the native source-branch commit flow
+
+## Scenario: busy request inputs are frozen
+
+- **WHEN** scanning, preflight, recovery or commit is active
+- **THEN** source, target selection, scope and file selection cannot change until the operation completes or is cancelled
+
+## Scenario: keyboard-first workbench
+
+- **WHEN** the workbench has focus
+- **THEN** Space toggles a selected checkbox, Enter invokes the enabled primary action, Escape cancels/returns, and Ctrl+F focuses branch search

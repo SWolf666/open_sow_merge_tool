@@ -36,7 +36,7 @@ from .svn_status_provider import (
     records_by_path,
     scan_status,
 )
-from .ui_foundation import THEME, UiTaskRunner, configure_ttk_style
+from .ui_foundation import THEME, UiTaskRunner, CommandState, configure_ttk_style
 
 SUPPORTED_EXTENSIONS = (".xlsx",)
 DEFAULT_BRANCHES = ("develop", "release", "sandbox")
@@ -1606,7 +1606,13 @@ class BranchSubmitEngine:
         batch.event("target-reconciled", target=target, committed=committed, pending=pending, unknown=unknown)
         return committed, pending, unknown
 
-    def commit(self, batch: BranchSubmitBatch, *, stop_on_failure: bool = True) -> BranchSubmitBatch:
+    def commit(self, batch: BranchSubmitBatch, *, stop_on_failure: bool = True, progress: Callable[[dict[str, object]], None] | None = None) -> BranchSubmitBatch:
+        def report(stage: str, current: str, done: int, total: int) -> None:
+            if progress is not None:
+                try:
+                    progress({"stage": stage, "current": current, "done": done, "total": total, "remaining": max(0, total - done)})
+                except Exception:
+                    pass
         if batch.source_status not in {"ready", "committed"}:
             raise RuntimeError(f"批次不可提交：source_status={batch.source_status}")
         if not str(batch.message or "").strip():
@@ -1622,6 +1628,8 @@ class BranchSubmitEngine:
                 f"仍有 {len(pending_confirmations)} 个目标文件需要人工确认，不能开始提交"
             )
         source_paths = [os.path.join(batch.wc_root, batch.source_branch, *plan.relative_path.split("/")) for plan in batch.files]
+        total_targets = len(batch.target_branches)
+        report("source", batch.source_branch, 0, max(1, total_targets))
         if batch.source_status == "ready":
             try:
                 exit_code = None
@@ -1670,6 +1678,8 @@ class BranchSubmitEngine:
         target_message = batch.message.rstrip() + "\n\n" + footer
         self._audit_incomplete_intents(batch)
         for target in batch.target_branches:
+            target_done = sum(state in {"committed", "already_present", "skipped"} for state in batch.target_status.values())
+            report("target", target, target_done, max(1, total_targets))
             if batch.target_status.get(target) in {"committed", "already_present", "skipped"}:
                 continue
             try:
@@ -1746,6 +1756,9 @@ class BranchSubmitEngine:
                 batch.event("target-error", target=target, error=batch.error)
                 if stop_on_failure:
                     break
+            finally:
+                target_done = sum(state in {"committed", "already_present", "skipped"} for state in batch.target_status.values())
+                report("target", target, target_done, max(1, total_targets))
         return batch
 
     def restore_uncommitted(self, batch: BranchSubmitBatch) -> BranchSubmitBatch:
@@ -1837,6 +1850,7 @@ def _choose_recovery_action(root, batches: list[BranchSubmitBatch]):
     import tkinter as tk
     from tkinter import ttk
     result = {"value": None}
+    closed = {"value": False}
     win = tk.Toplevel(root)
     win.title("检测到未完成的多分支提交")
     win.geometry("850x330")
@@ -1861,16 +1875,35 @@ def _choose_recovery_action(root, batches: list[BranchSubmitBatch]):
         values = tree.selection()
         return next((batch for batch in batches if values and batch.batch_id == values[0]), None)
     def finish(action):
+        if closed["value"]:
+            return
         batch = selected()
         if batch:
+            if action == "restore":
+                from tkinter import messagebox
+                if not messagebox.askyesno("确认恢复", "将仅恢复已核对为未提交的候选文件，已提交内容不会回滚。\n\n继续吗？", parent=win):
+                    return
+            elif action == "abandon":
+                from tkinter import messagebox
+                if not messagebox.askyesno("确认放弃批次", "将放弃该批次并保留当前工作副本，不再自动恢复。\n\n继续吗？", parent=win):
+                    return
             result["value"] = (action, batch)
-            win.destroy()
+            close_window()
+    def close_window():
+        if closed["value"]:
+            return
+        closed["value"] = True
+        try: win.grab_release()
+        except tk.TclError: pass
+        try:
+            if win.winfo_exists(): win.destroy()
+        except tk.TclError: pass
     ttk.Button(buttons, text="继续批次", command=lambda: finish("continue")).pack(side="left")
     ttk.Button(buttons, text="恢复未提交工作副本", command=lambda: finish("restore")).pack(side="left", padx=6)
     ttk.Button(buttons, text="放弃批次", command=lambda: finish("abandon")).pack(side="left")
     ttk.Button(buttons, text="查看批次目录", command=lambda: os.startfile(selected().folder) if selected() else None).pack(side="left", padx=6)
-    ttk.Button(buttons, text="稍后处理", command=win.destroy).pack(side="right")
-    win.protocol("WM_DELETE_WINDOW", win.destroy)
+    ttk.Button(buttons, text="稍后处理", command=close_window).pack(side="right")
+    win.protocol("WM_DELETE_WINDOW", close_window)
     win.update_idletasks()
     win.deiconify()
     win.lift()
@@ -1884,12 +1917,82 @@ def _choose_recovery_action(root, batches: list[BranchSubmitBatch]):
     return result["value"]
 
 
+def _restore_batch_with_progress(
+    root,
+    engine: BranchSubmitEngine,
+    batch: BranchSubmitBatch,
+    *,
+    _on_progress=None,
+) -> dict[str, object]:
+    """Run recovery off the Tk thread with an idempotent progress window.
+
+    The close protocol deliberately refuses to destroy the window while the
+    worker is alive.  The returned state is safe to consume even when the
+    owner/root is already closing or a late callback observes a destroyed
+    Tk widget.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    progress = tk.Toplevel(root)
+    progress.title("正在恢复批次")
+    progress.geometry("420x150")
+    progress_status = tk.StringVar(value="正在核对并恢复未提交工作副本…")
+    ttk.Label(progress, textvariable=progress_status, padding=18).pack(fill="both", expand=True)
+    state: dict[str, object] = {"done": False}
+
+    def restore_worker():
+        try:
+            state["result"] = engine.restore_uncommitted(batch)
+        except Exception as exc:
+            state["error"] = exc
+
+    thread = threading.Thread(
+        target=restore_worker,
+        name="sow-recovery-restore",
+        daemon=True,
+    )
+    thread.start()
+
+    def finish_progress():
+        if not state.get("done") and thread.is_alive():
+            try:
+                progress_status.set("恢复进行中，完成前不能关闭此窗口…")
+                root.bell()
+            except (RuntimeError, tk.TclError):
+                pass
+            return
+        try:
+            if progress.winfo_exists():
+                progress.destroy()
+        except tk.TclError:
+            pass
+
+    # WM_DELETE is registered before the first event-loop turn, so an early
+    # user click cannot destroy the window behind the recovery worker.
+    progress.protocol("WM_DELETE_WINDOW", finish_progress)
+    if callable(_on_progress):
+        _on_progress(progress)
+    while thread.is_alive():
+        try:
+            root.update()
+        except tk.TclError:
+            break
+        time.sleep(0.02)
+    state["done"] = True
+    finish_progress()
+    return state
+
+
 class BranchSubmitWorkbench:
     """TortoiseSVN-inspired Tk workbench; no repository writes happen here."""
 
     STATUS_TEXT: ClassVar[dict[str, str]] = {
         "modified": "已修改（modified）", "added": "新增（added）", "deleted": "已删除（deleted）", "missing": "缺失（missing）",
         "unversioned": "未版本化（unversioned）", "conflicted": "冲突（conflicted）", "normal": "正常（normal）",
+        "ready": "可直接同步", "confirmation_required": "需人工确认", "blocked": "安全阻断",
+        "already_present": "已同步", "committed": "已提交", "partial": "部分成功",
+        "pending": "待处理", "failed": "失败", "cancelled": "已取消",
     }
 
     def __init__(self, root, context: BranchContext, *, resume_batch: BranchSubmitBatch | None = None):
@@ -1917,12 +2020,14 @@ class BranchSubmitWorkbench:
         self._target_rows: dict[str, str] = {}
         self._target_status_map: dict[str, str] = {}
         self._target_rebuild_after = None
+        self._target_rebuild_pending = False
         self._item_rows: dict[str, SvnChangeItem] = {}
         self._preflight_generation = 0
         self._selection_generation = 0
         self._approved_preflight_signature: tuple | None = None
         self._scan_active = False
         self._preflight_active = False
+        self._preflight_cancel_requested = False
         self._confirmation_active = False
         self._confirmation_dialog = None
         self._confirmation_dialog_tree = None
@@ -1931,7 +2036,13 @@ class BranchSubmitWorkbench:
         self._confirmation_detail = None
         self._confirmation_dialog_summary_var = None
         self._confirmation_dialog_rows: dict[tuple[str, str], str] = {}
+        self.matrix_panel = None
+        self._matrix_panel_tree = None
+        self._matrix_panel_row_map: dict[str, tuple[str, FilePlan]] = {}
+        self._matrix_panel_summary = None
         self._commit_active = False
+        self._commit_progress_queue: queue.Queue = queue.Queue()
+        self._commit_progress_generation = 0
         self.ui_tasks = UiTaskRunner(root)
         self.source_var = tk.StringVar(value=context.source_branch)
         self.scope_var = tk.StringVar(value=context.scope_path)
@@ -1940,6 +2051,9 @@ class BranchSubmitWorkbench:
         self.show_unversioned_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="正在读取 SVN 状态…")
         self.count_var = tk.StringVar(value="0 个文件")
+        self.work_mode_var = tk.StringVar(value="源分支单提交")
+        self.step_text_var = tk.StringVar(value="① 选择内容   ② SVN 单分支提交")
+        self._keyboard_search_entry = None
         self._build_style()
         self._build_ui()
         self._refresh_source_metadata()
@@ -1950,6 +2064,21 @@ class BranchSubmitWorkbench:
             self.submit_button.state(["disabled"])
             self.status_var.set(f"已载入未完成批次 {resume_batch.batch_id}；请先重新预检查")
         self._start_scan(preserve_batch=bool(resume_batch))
+
+    def _ui_busy(self) -> bool:
+        """Inputs affecting an SVN request are frozen for its full lifetime."""
+        return bool(self._confirmation_active or self._commit_active or self._preflight_active or self._scan_active)
+
+    def command_state(self) -> CommandState:
+        return CommandState(
+            busy=self._ui_busy() or self.closing,
+            ready=bool(self.items),
+            has_selection=bool(self._selected_items()),
+            has_unsaved_changes=bool(self.current_batch),
+            has_conflicts=bool(self._confirmation_entries()),
+            can_save=bool(self._selected_targets() or self._selected_items()),
+            can_undo=False,
+        )
 
     def _build_style(self):
         style = configure_ttk_style(self.root)
@@ -1988,7 +2117,11 @@ class BranchSubmitWorkbench:
         header.pack(fill="x", pady=(0, 10))
         header_copy = ttk.Frame(header, style="Workbench.Header.TFrame")
         header_copy.pack(side="left", fill="x", expand=True)
-        ttk.Label(header_copy, text="多分支 SVN 提交", style="Workbench.HeaderTitle.TLabel").pack(anchor="w")
+        title_row = ttk.Frame(header_copy, style="Workbench.Header.TFrame")
+        title_row.pack(anchor="w", fill="x")
+        ttk.Label(title_row, text="多分支 SVN 工作台", style="Workbench.HeaderTitle.TLabel").pack(side="left")
+        self.mode_label = ttk.Label(title_row, textvariable=self.work_mode_var, style="Workbench.Step.TLabel")
+        self.mode_label.pack(side="left", padx=(12, 0))
         ttk.Label(
             header_copy,
             text="将源分支已修改内容安全同步到所选目标分支，再逐分支打开 TortoiseSVN 提交",
@@ -1996,8 +2129,8 @@ class BranchSubmitWorkbench:
         ).pack(anchor="w", pady=(2, 0))
         steps = ttk.Frame(header, style="Workbench.Header.TFrame")
         steps.pack(side="right", padx=(16, 0))
-        for text in ("1 选择内容", "2 预检查", "3 开始提交"):
-            ttk.Label(steps, text=text, style="Workbench.Step.TLabel").pack(side="left", padx=(5, 0))
+        self.steps_label = ttk.Label(steps, textvariable=self.step_text_var, style="Workbench.Step.TLabel")
+        self.steps_label.pack(side="left", padx=(5, 0))
 
         info = ttk.LabelFrame(outer, text="提交范围", padding=10, style="Panel.TLabelframe"); info.pack(fill="x")
         ttk.Label(info, text="源分支").grid(row=0, column=0, sticky="w")
@@ -2005,7 +2138,9 @@ class BranchSubmitWorkbench:
         self.source_box = ttk.Combobox(info, textvariable=self.source_var, values=sources, state="readonly", width=22)
         self.source_box.grid(row=0, column=1, sticky="w", padx=(8, 24)); self.source_box.bind("<<ComboboxSelected>>", self._source_changed)
         ttk.Label(info, text="提交到").grid(row=0, column=2, sticky="w")
-        ttk.Label(info, textvariable=self.repo_url_var, foreground=THEME.accent).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.repo_url_label = ttk.Label(info, textvariable=self.repo_url_var, foreground=THEME.accent, cursor="hand2")
+        self.repo_url_label.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.repo_url_label.bind("<Button-1>", self._open_repository_url)
         ttk.Label(info, text="扫描范围").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(info, textvariable=self.scope_var, state="readonly").grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(8, 0))
         info.columnconfigure(3, weight=1)
@@ -2016,7 +2151,8 @@ class BranchSubmitWorkbench:
         ttk.Label(target_box, textvariable=self.target_summary_var, style="Workbench.Summary.TLabel").pack(fill="x", pady=(0, 8))
         search_row = ttk.Frame(target_box); search_row.pack(fill="x")
         ttk.Label(search_row, text="筛选").pack(side="left", padx=(0, 6))
-        ttk.Entry(search_row, textvariable=self.target_search_var).pack(side="left", fill="x", expand=True)
+        self._keyboard_search_entry = ttk.Entry(search_row, textvariable=self.target_search_var)
+        self._keyboard_search_entry.pack(side="left", fill="x", expand=True)
         self.target_search_var.trace_add("write", lambda *_: self._schedule_rebuild_targets())
         quick = ttk.Frame(target_box); quick.pack(fill="x", pady=6)
         ttk.Button(quick, text="全选", command=lambda: self._set_targets("all")).pack(side="left")
@@ -2024,6 +2160,7 @@ class BranchSubmitWorkbench:
         ttk.Button(quick, text="常用", command=lambda: self._set_targets("favorite")).pack(side="left")
         canvas_holder = ttk.Frame(target_box, style="Panel.TFrame"); canvas_holder.pack(fill="both", expand=True, pady=(6, 0))
         target_scroll = ttk.Scrollbar(canvas_holder, orient="vertical")
+        target_xscroll = ttk.Scrollbar(canvas_holder, orient="horizontal")
         self.target_tree = ttk.Treeview(
             canvas_holder,
             columns=("check", "favorite", "branch", "state", "changed"),
@@ -2031,9 +2168,11 @@ class BranchSubmitWorkbench:
             selectmode="browse",
             height=4,
             yscrollcommand=target_scroll.set,
+            xscrollcommand=target_xscroll.set,
             style="Workbench.Treeview",
         )
         target_scroll.configure(command=self.target_tree.yview)
+        target_xscroll.configure(command=self.target_tree.xview)
         for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 125), ("state", "处理状态", 90), ("changed", "最近修改", 112)):
             self.target_tree.heading(key, text=title)
             self.target_tree.column(key, width=width, anchor="center" if key in {"check", "favorite"} else "w", stretch=key == "branch")
@@ -2041,12 +2180,16 @@ class BranchSubmitWorkbench:
         self.target_tree.tag_configure("confirmation", foreground=THEME.error, background="#FDE7E9", font=(THEME.font_family, 9, "bold"))
         self.target_tree.tag_configure("blocked", foreground=THEME.error)
         self.target_tree.tag_configure("committed", foreground=THEME.success)
-        self.target_tree.pack(side="left", fill="both", expand=True); target_scroll.pack(side="right", fill="y")
+        self.target_tree.tag_configure("frozen", foreground=THEME.disabled)
+        self.target_tree.pack(side="left", fill="both", expand=True); target_scroll.pack(side="right", fill="y"); target_xscroll.pack(side="bottom", fill="x")
         self.target_tree.bind("<Button-1>", self._target_tree_click)
         self.target_tree.bind("<space>", self._target_space)
         self.target_tree.bind("<Double-1>", self._target_tree_double_click)
+        self.target_tree.bind("<Motion>", self._target_tree_hover)
+        self.target_tree.bind("<Button-3>", self._target_tree_menu)
 
         main = ttk.Frame(paned, style="App.TFrame"); paned.add(main, weight=5)
+        self.workbench_main = main
         message_box = ttk.LabelFrame(main, text="提交说明", padding=10, style="Panel.TLabelframe"); message_box.pack(fill="x")
         message_tools = ttk.Frame(message_box); message_tools.pack(fill="x", pady=(0, 6))
         ttk.Button(message_tools, text="最近提交消息", command=self._show_recent_messages).pack(side="left")
@@ -2076,6 +2219,7 @@ class BranchSubmitWorkbench:
         self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended", height=4, style="Workbench.Treeview")
         self.tree.tag_configure("alternate", background=THEME.row_alt)
         self.tree.tag_configure("not_selectable", foreground=THEME.disabled)
+        self.tree.tag_configure("frozen", foreground=THEME.disabled)
         headings = {"check":"✓", "path":"路径", "handling":"多分支处理", "extension":"扩展名", "status":"状态", "property":"属性状态", "lock":"锁定", "switched":"已切换", "changelist":"变更列表"}
         widths = {"check":38, "path":320, "handling":170, "extension":72, "status":150, "property":105, "lock":80, "switched":70, "changelist":120}
         widths.update({key: int(value) for key, value in self.settings.get("column_widths", {}).items() if key in widths})
@@ -2086,6 +2230,7 @@ class BranchSubmitWorkbench:
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         self.tree.pack(side="left", fill="both", expand=True); yscroll.pack(side="right", fill="y"); xscroll.pack(side="bottom", fill="x")
         self.tree.bind("<Button-1>", self._tree_click); self.tree.bind("<Double-1>", self._tree_double_click); self.tree.bind("<Button-3>", self._tree_menu)
+        self.tree.bind("<space>", self._tree_space)
 
         # Reserve a real footer before the expandable panes.  The previous
         # packing order allowed the new header and tall trees to push the
@@ -2132,6 +2277,50 @@ class BranchSubmitWorkbench:
         self.status_label = ttk.Label(status_area, textvariable=self.status_var, style="Status.Footer.TLabel")
         self.status_label.pack(side="left", fill="x", expand=True, padx=(18, 0))
         self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self.root.bind("<Escape>", lambda _e: self._close())
+        self.root.bind("<Control-f>", self._focus_target_search)
+        self.root.bind("<Return>", self._root_enter)
+        self._update_work_mode()
+
+    def _root_enter(self, event=None):
+        """Route Enter only from workbench surfaces, never text inputs."""
+        widget = getattr(event, "widget", None)
+        if widget is self.message or widget is self._keyboard_search_entry or widget is self.source_box:
+            # Text keeps its normal newline behavior; single-line inputs just
+            # consume Enter so it cannot accidentally trigger a submission.
+            return None if widget is self.message else "break"
+        try:
+            if isinstance(widget, (self.tk.Text, self.tk.Entry, self.ttk.Entry, self.ttk.Combobox)):
+                return "break"
+        except (AttributeError, TypeError):
+            pass
+        if self.submit_button.instate(["!disabled"]):
+            self._submit()
+        elif self.preflight_button.instate(["!disabled"]):
+            self._preflight()
+        else:
+            return "break"
+        return "break"
+
+    def _focus_target_search(self, _event=None):
+        if self._keyboard_search_entry is not None:
+            self._keyboard_search_entry.focus_set()
+            self._keyboard_search_entry.selection_range(0, self.tk.END)
+        return "break"
+
+    def _open_repository_url(self, _event=None):
+        url = self.repo_url_var.get().strip()
+        if url and url.startswith(("http://", "https://", "file://", "svn://")):
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    def _update_work_mode(self):
+        multi = bool(self._selected_targets()) if hasattr(self, "target_vars") else False
+        self.work_mode_var.set("多分支同步" if multi else "源分支单提交")
+        self.step_text_var.set("① 选择内容   ② 预检查（必需）   ③ 开始提交" if multi else "① 选择内容   ② SVN 单分支提交")
 
     def _candidate_for_source(self):
         return next((item for item in self.candidates if item.name == self.source_var.get()), None)
@@ -2141,7 +2330,7 @@ class BranchSubmitWorkbench:
         self.repo_url_var.set(candidate.url if candidate else "")
 
     def _source_changed(self, _event=None):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return
         source = self.source_var.get()
         self.context.source_branch = source
@@ -2162,6 +2351,12 @@ class BranchSubmitWorkbench:
     def _rebuild_targets(self):
         tk = self.tk
         self._target_rebuild_after = None
+        if self._ui_busy():
+            # Preserve the current request while a scan/preflight/commit owns
+            # the controls; the next completion callback rebuilds the view.
+            self._target_rebuild_pending = True
+            return
+        self._target_rebuild_pending = False
         self._target_selection.update({name: bool(var.get()) for name, var in self.target_vars.items()})
         remembered = set(self.settings.get("last_targets", {}).get(self.source_var.get(), []))
         for iid in self.target_tree.get_children():
@@ -2183,7 +2378,7 @@ class BranchSubmitWorkbench:
             self.target_tree.insert("", "end", iid=iid, values=("☑" if var.get() else "☐", "★" if candidate.favorite else "☆", candidate.name, state, changed), tags=(tag,))
 
     def _target_tree_click(self, event):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return "break"
         iid = self.target_tree.identify_row(event.y)
         if not iid:
@@ -2204,7 +2399,7 @@ class BranchSubmitWorkbench:
         return "break"
 
     def _target_space(self, _event=None):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return "break"
         selection = self.target_tree.selection()
         if selection:
@@ -2218,13 +2413,33 @@ class BranchSubmitWorkbench:
         return "break"
 
     def _target_tree_double_click(self, event):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return "break"
         iid = self.target_tree.identify_row(event.y)
         name = self._target_rows.get(iid)
         if name and self._target_status_map.get(name) == "需人工确认":
             self._open_confirmation_dialog(preferred_target=name)
+        return "break"
+
+    def _target_tree_hover(self, event):
+        iid = self.target_tree.identify_row(event.y)
+        name = self._target_rows.get(iid)
+        if name:
+            self.target_tree.configure(cursor="hand2")
+            self.status_var.set(f"目标分支：{name}")
+
+    def _target_tree_menu(self, event):
+        if self._ui_busy():
             return "break"
+        iid = self.target_tree.identify_row(event.y)
+        name = self._target_rows.get(iid)
+        if not name:
+            return "break"
+        self.target_tree.selection_set(iid)
+        menu = self.tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="复制分支名", command=lambda value=name: (self.root.clipboard_clear(), self.root.clipboard_append(value)))
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     def _toggle_favorite(self, name: str):
         favorites = set(self.settings.get("favorite_branches", list(DEFAULT_BRANCHES)))
@@ -2236,7 +2451,7 @@ class BranchSubmitWorkbench:
         self._rebuild_targets()
 
     def _set_targets(self, mode: str):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return
         for candidate in self.candidates:
             if candidate.name == self.source_var.get():
@@ -2273,6 +2488,7 @@ class BranchSubmitWorkbench:
         self._scan_active = True
         self.status_var.set("正在递归读取 SVN 状态…"); self.preflight_button.state(["disabled"])
         self.submit_button.state(["disabled"])
+        self._refresh_primary_button()
         self.scan_stop_button.state(["!disabled"]); self.scan_progress.start(12)
         def worker():
             try:
@@ -2352,6 +2568,8 @@ class BranchSubmitWorkbench:
         self._refresh_primary_button()
 
     def _tree_click(self, event):
+        if self._ui_busy():
+            return "break"
         if self.tree.identify_region(event.x, event.y) != "cell" or self.tree.identify_column(event.x) != "#1": return
         iid = self.tree.identify_row(event.y)
         if not iid: return
@@ -2364,7 +2582,21 @@ class BranchSubmitWorkbench:
             self._invalidate_batch()
         return "break"
 
+    def _tree_space(self, _event=None):
+        if self._ui_busy():
+            return "break"
+        selection = self.tree.selection()
+        if selection:
+            item = self._item_rows.get(selection[0])
+            if item is not None and item.selectable:
+                item.checked = not item.checked
+                self.tree.set(selection[0], "check", "☑" if item.checked else "☐")
+                self._invalidate_batch()
+        return "break"
+
     def _tree_double_click(self, event):
+        if self._ui_busy():
+            return "break"
         iid = self.tree.identify_row(event.y)
         if iid:
             item = self._item_rows.get(iid)
@@ -2374,6 +2606,8 @@ class BranchSubmitWorkbench:
                 threading.Thread(target=lambda: self.engine.show_diff(item.path), daemon=True).start()
 
     def _tree_menu(self, event):
+        if self._ui_busy():
+            return "break"
         tk = self.tk; iid = self.tree.identify_row(event.y)
         if not iid: return
         self.tree.selection_set(iid); item = self._item_rows.get(iid)
@@ -2387,7 +2621,7 @@ class BranchSubmitWorkbench:
         menu.tk_popup(event.x_root, event.y_root)
 
     def _quick_check(self, mode: str):
-        if self._confirmation_active or self._commit_active:
+        if self._ui_busy():
             return
         for item in self.items:
             if not item.selectable: continue
@@ -2491,13 +2725,37 @@ class BranchSubmitWorkbench:
     def _refresh_primary_button(self):
         if not hasattr(self, "submit_button"):
             return
-        busy = (
-            self._commit_active
-            or self._preflight_active
-            or self._confirmation_active
-            or self._scan_active
-            or self.closing
-        )
+        command_state = self.command_state()
+        busy = command_state.busy
+        was_busy = bool(getattr(self, "_inputs_frozen_previous", False))
+        # Keep request-signing inputs immutable while a scan/preflight/commit
+        # is running.  This also makes the busy state obvious to keyboard users.
+        self._inputs_frozen = busy
+        for widget in (getattr(self, "source_box", None), getattr(self, "_keyboard_search_entry", None)):
+            if widget is not None:
+                try:
+                    widget.configure(state="disabled" if busy else "readonly" if widget is self.source_box else "normal")
+                except Exception:
+                    pass
+        was_frozen = bool(getattr(self, "_inputs_frozen_previous", False))
+        self._inputs_frozen_previous = busy
+        for tree in (getattr(self, "target_tree", None), getattr(self, "tree", None)):
+            if tree is None:
+                continue
+            if not busy and not was_frozen:
+                continue
+            for iid in tree.get_children():
+                tags = list(tree.item(iid, "tags") or ())
+                if busy and "frozen" not in tags:
+                    tags.append("frozen")
+                elif not busy:
+                    tags = [tag for tag in tags if tag != "frozen"]
+                tree.item(iid, tags=tuple(tags))
+        if not busy and was_busy and getattr(self, "_target_rebuild_pending", False):
+            # Search/source/selection events may have arrived while the tree
+            # was frozen. Rebuild once after the operation releases the
+            # request-signing controls, preserving the pending selection.
+            self._rebuild_targets()
         selected_targets = self._selected_targets()
         if not selected_targets:
             self.preflight_button.configure(text="① 预检查（多分支）")
@@ -2543,11 +2801,19 @@ class BranchSubmitWorkbench:
                     label = labels.get(state, state)
                 self._target_status_map[target] = label
         selected = self._selected_targets()
-        counts = {"可直接同步": 0, "需人工确认": 0, "安全阻断": 0, "已提交": 0}
+        counts = {
+            "可直接同步": 0,
+            "需人工确认": 0,
+            "安全阻断": 0,
+            "已提交": 0,
+            "目标不处理": 0,
+        }
         for name in selected:
             counts[self._target_status_map.get(name, "待检查")] = counts.get(self._target_status_map.get(name, "待检查"), 0) + 1
         self.target_summary_var.set(
-            f"已选 {len(selected)} · 可直接 {counts['可直接同步']} · 待确认 {counts['需人工确认']} · 阻断 {counts['安全阻断']}"
+            f"已选 {len(selected)} · 可直接 {counts['可直接同步']} · "
+            f"待确认 {counts['需人工确认']} · 阻断 {counts['安全阻断']} · "
+            f"不处理 {counts['目标不处理']}"
         )
         if not selected:
             self.target_summary_var.set(
@@ -2557,6 +2823,7 @@ class BranchSubmitWorkbench:
             self.target_summary_var.set(
                 f"已选 {len(selected)} · 尚未预检查 · 完成预检查后才能开始多分支提交"
             )
+        self._update_work_mode()
         self._update_confirmation_alert()
         self._rebuild_targets()
 
@@ -2771,11 +3038,22 @@ class BranchSubmitWorkbench:
                 target, plan.relative_path, "excluded", "已从该目标分支批次移除"
             )
             self._render_target_statuses()
+            if getattr(self, "matrix_panel", None) is not None:
+                self._show_matrix_panel(self.current_batch)
             self._refresh_primary_button()
 
         def close_dialog():
             if self._confirmation_active:
                 self.status_var.set("正在核对确认项，请稍候")
+                return
+            try:
+                if not win.winfo_exists():
+                    self._confirmation_dialog = None
+                    self._confirmation_dialog_tree = None
+                    return
+            except self.tk.TclError:
+                self._confirmation_dialog = None
+                self._confirmation_dialog_tree = None
                 return
             try:
                 win.grab_release()
@@ -2788,7 +3066,10 @@ class BranchSubmitWorkbench:
             self._confirmation_detail = None
             self._confirmation_dialog_summary_var = None
             self._confirmation_dialog_rows = {}
-            win.destroy()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
         ttk.Button(buttons, text="关闭", command=close_dialog).pack(side="right")
         self._confirmation_dialog_button = ttk.Button(
@@ -2910,6 +3191,8 @@ class BranchSubmitWorkbench:
                 "已确认采用源分支修改",
             )
             self._render_target_statuses()
+            if getattr(self, "matrix_panel", None) is not None:
+                self._show_matrix_panel(self.current_batch)
             remaining = len(self._confirmation_entries())
             if remaining:
                 self.status_var.set(f"已确认；仍有 {remaining} 个文件需要处理")
@@ -3197,9 +3480,9 @@ class BranchSubmitWorkbench:
             self.root.after_idle(self._open_confirmation_dialog)
 
         preview_button.configure(command=compare_selected)
-        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
+        ttk.Button(footer, text="返回工作台", command=win.destroy).pack(side="right")
         if batch.source_status == "ready":
-            ttk.Button(footer, text="保留预检查结果", style="Primary.TButton", command=accept).pack(side="right", padx=6)
+            ttk.Button(footer, text="确认并返回工作台", style="Primary.TButton", command=accept).pack(side="right", padx=6)
         if self._confirmation_entries():
             ttk.Button(footer, text="处理人工确认", style="Danger.TButton", command=open_confirmations).pack(side="right", padx=6)
         tree.bind("<<TreeviewSelect>>", update_selection)
@@ -3209,9 +3492,159 @@ class BranchSubmitWorkbench:
             tree.selection_set(first[0])
             tree.focus(first[0])
             update_selection()
+        # Re-assert the usable matrix width after all children have negotiated
+        # their requested geometry (important on 125%/150% DPI desktops).
+        try:
+            win.update_idletasks()
+            if win.winfo_width() < 860:
+                win.geometry("860x560")
+        except Exception:
+            pass
         win.grab_set()
         self.root.wait_window(win)
         return result["ok"]
+
+    def _show_matrix_panel(self, batch: BranchSubmitBatch) -> bool:
+        """Render preflight results in the resizable main workbench.
+
+        The old modal matrix remains available as a compatibility inspection
+        dialog for existing integrations; the normal preflight path uses this
+        dock so the source/file lists remain visible and the user can continue
+        reviewing without a duplicate close/keep-results decision.
+        """
+        existing = getattr(self, "matrix_panel", None)
+        try:
+            existing_alive = existing is not None and bool(existing.winfo_exists())
+        except Exception:
+            existing_alive = False
+        if existing_alive and getattr(self, "_matrix_panel_tree", None) is not None:
+            # Refresh the embedded matrix in place.  Keeping the Treeview
+            # object preserves its scroll/focus state while preflight or
+            # confirmation callbacks update action rows incrementally.
+            panel = existing
+            tree = self._matrix_panel_tree
+            row_map = self._matrix_panel_row_map
+            selected_key = None
+            try:
+                selected = tree.selection()
+                if selected:
+                    selected_entry = row_map.get(selected[0])
+                    if selected_entry:
+                        selected_key = (
+                            selected_entry[0],
+                            selected_entry[1].relative_path,
+                        )
+            except Exception:
+                pass
+            states = [action.state for plan in batch.files for action in plan.actions.values()]
+            summary = getattr(self, "_matrix_panel_summary", None)
+            if summary is not None:
+                summary.set(
+                    f"目标 {len(batch.target_branches)} · 文件 {len(batch.files)} · "
+                    f"可直接 {states.count('ready')} · 需确认 {states.count('confirmation_required')} · "
+                    f"阻断 {states.count('blocked')}"
+                )
+            state_labels = getattr(self, "_matrix_panel_state_labels", {
+                "ready": "可直接同步", "confirmation_required": "需人工确认", "blocked": "安全阻断",
+                "already_applied": "已包含修改", "excluded": "目标不处理", "prepared": "已准备", "committed": "已提交",
+            })
+            operation_labels = getattr(self, "_matrix_panel_operation_labels", {
+                "modify": "修改", "add": "新增", "delete": "删除", SOURCE_ONLY_MISSING: "仅源分支",
+            })
+            for iid in tree.get_children():
+                tree.delete(iid)
+            row_map.clear()
+            for index, (plan, target) in enumerate(
+                (pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches))
+            ):
+                action = plan.actions[target]
+                iid = f"panel-matrix-{index}"
+                key = (target, plan.relative_path)
+                # Keep the closure callbacks' original (target, FilePlan)
+                # contract while using a compact key only for selection restore.
+                row_map[iid] = (target, plan)
+                tree.insert(
+                    "", "end", iid=iid,
+                    values=(
+                        target,
+                        plan.relative_path,
+                        operation_labels.get(plan.operation, plan.operation),
+                        state_labels.get(action.state, action.state),
+                        action.reason or "保留目标分支其他内容",
+                    ),
+                )
+                if selected_key == key:
+                    tree.selection_set(iid)
+                    tree.focus(iid)
+            if not tree.selection():
+                first = tree.get_children()
+                if first:
+                    tree.selection_set(first[0]); tree.focus(first[0])
+            if getattr(panel, "winfo_manager", lambda: "")() == "":
+                panel.pack(fill="both", expand=True, pady=(8, 0))
+            return True
+        if existing is not None:
+            try:
+                self.matrix_panel.destroy()
+            except Exception:
+                pass
+        panel = self.ttk.LabelFrame(self.workbench_main, text="预检查结果（可伸缩）", padding=8, style="Panel.TLabelframe")
+        panel.pack(fill="both", expand=True, pady=(8, 0))
+        self.matrix_panel = panel
+        states = [action.state for plan in batch.files for action in plan.actions.values()]
+        summary = self.tk.StringVar(value=(
+            f"目标 {len(batch.target_branches)} · 文件 {len(batch.files)} · "
+            f"可直接 {states.count('ready')} · 需确认 {states.count('confirmation_required')} · 阻断 {states.count('blocked')}"
+        ))
+        self._matrix_panel_summary = summary
+        self.ttk.Label(panel, textvariable=summary, style="Workbench.Summary.TLabel").pack(fill="x", pady=(0, 6))
+        holder = self.ttk.Frame(panel, style="Panel.TFrame")
+        holder.pack(fill="both", expand=True)
+        tree = self.ttk.Treeview(holder, columns=("branch", "file", "operation", "state", "reason"), show="headings", selectmode="browse", style="Workbench.Treeview", height=5)
+        for key, title, width in (("branch", "目标分支", 130), ("file", "文件", 240), ("operation", "动作", 70), ("state", "处理状态", 110), ("reason", "说明", 360)):
+            tree.heading(key, text=title); tree.column(key, width=width, anchor="w", stretch=key in {"file", "reason"})
+        state_labels = {"ready": "可直接同步", "confirmation_required": "需人工确认", "blocked": "安全阻断", "already_applied": "已包含修改", "excluded": "目标不处理", "prepared": "已准备", "committed": "已提交"}
+        operation_labels = {"modify": "修改", "add": "新增", "delete": "删除", SOURCE_ONLY_MISSING: "仅源分支"}
+        self._matrix_panel_state_labels = state_labels
+        self._matrix_panel_operation_labels = operation_labels
+        row_map = {}
+        self._matrix_panel_row_map = row_map
+        for index, (plan, target) in enumerate((pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches))):
+            action = plan.actions[target]
+            iid = f"panel-matrix-{index}"; row_map[iid] = (target, plan)
+            tree.insert("", "end", iid=iid, values=(target, plan.relative_path, operation_labels.get(plan.operation, plan.operation), state_labels.get(action.state, action.state), action.reason or "保留目标分支其他内容"))
+        scroll = self.ttk.Scrollbar(holder, orient="vertical", command=tree.yview); tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
+        self._matrix_panel_tree = tree
+        footer = self.ttk.Frame(panel, style="Panel.TFrame"); footer.pack(fill="x", pady=(6, 0))
+        detail = self.tk.StringVar(value="选择一项查看安全判断。")
+        self.ttk.Label(footer, textvariable=detail, style="Workbench.Hint.TLabel").pack(side="left", fill="x", expand=True)
+        def selected():
+            sel = tree.selection(); return row_map.get(sel[0]) if sel else None
+        def show_preview():
+            entry = selected()
+            if not entry: return
+            target, plan = entry; action = plan.actions[target]
+            if plan.operation == "modify" and action.state in {"ready", "confirmation_required"}:
+                active_batch = self.current_batch or batch
+                threading.Thread(
+                    target=lambda: self.engine.open_excel_comparison(active_batch, plan, target),
+                    daemon=True,
+                ).start()
+        def show_detail(_event=None):
+            entry = selected()
+            if entry:
+                target, plan = entry; action = plan.actions[target]
+                detail.set(f"{target} / {plan.relative_path} · {state_labels.get(action.state, action.state)}：{action.reason or '无补充说明'}")
+        tree.bind("<<TreeviewSelect>>", show_detail)
+        self.ttk.Button(footer, text="查看目标修改点", command=show_preview).pack(side="right", padx=(6, 0))
+        if self._confirmation_entries():
+            self.ttk.Button(footer, text="处理人工确认", style="Danger.TButton", command=self._open_confirmation_dialog).pack(side="right", padx=(6, 0))
+        self.ttk.Button(footer, text="收起结果", command=panel.pack_forget).pack(side="right")
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0]); tree.focus(first[0]); show_detail()
+        return True
 
     def _preflight(self, *, auto_start: bool = False):
         from tkinter import messagebox
@@ -3237,6 +3670,7 @@ class BranchSubmitWorkbench:
         self._update_confirmation_alert()
         self.submit_button.state(["disabled"])
         self.preflight_button.state(["disabled"])
+        self._refresh_primary_button()
         self.status_var.set(
             f"正在更新 {len(targets)} 个目标分支的相关路径，随后生成预检查矩阵…"
         )
@@ -3253,6 +3687,7 @@ class BranchSubmitWorkbench:
 
         def done(batch, error, _generation):
             self._preflight_active = False
+            self._preflight_cancel_requested = False
             if selection_generation != self._selection_generation:
                 self.status_var.set("预检查期间选择已变化，请重新执行预检查")
                 self._refresh_primary_button()
@@ -3270,7 +3705,7 @@ class BranchSubmitWorkbench:
             self._approved_preflight_signature = request_signature
             self._render_target_statuses()
             if not auto_start:
-                self._matrix_dialog(batch)
+                self._show_matrix_panel(batch)
             if batch.source_status == "ready":
                 ready_count = sum(a.state == "ready" for p in batch.files for a in p.actions.values())
                 confirmation_count = sum(a.state == "confirmation_required" for p in batch.files for a in p.actions.values())
@@ -3326,11 +3761,41 @@ class BranchSubmitWorkbench:
         self.submit_button.state(["disabled"])
         self.preflight_button.state(["disabled"])
         self._commit_active = True
-        self.status_var.set("等待 TortoiseSVN 提交与逐文件对账…")
+        self._commit_progress_generation += 1
+        progress_generation = self._commit_progress_generation
+        while not self._commit_progress_queue.empty():
+            try: self._commit_progress_queue.get_nowait()
+            except queue.Empty: break
+        self._refresh_primary_button()
+        self.status_var.set(
+            f"提交中：当前分支 {batch.source_branch}；目标分支 0/{len(batch.target_branches)}；已完成 0，剩余 {len(batch.target_branches)}"
+        )
         self.root.update_idletasks()
+
+        def poll_progress():
+            if self.closing:
+                return
+            try:
+                while True:
+                    progress = self._commit_progress_queue.get_nowait()
+                    if progress.get("generation") != progress_generation:
+                        continue
+                    self.status_var.set(
+                        f"{progress.get('stage', '提交')}：当前分支 {progress.get('current', '-')}；"
+                        f"已完成 {progress.get('done', 0)}/{progress.get('total', 0)}，剩余 {progress.get('remaining', 0)}"
+                    )
+            except queue.Empty:
+                pass
+            if self._commit_active:
+                self.root.after(60, poll_progress)
+        self.root.after(0, poll_progress)
 
         def done(result, error, _generation):
             self._commit_active = False
+            self._commit_progress_generation += 1
+            while not self._commit_progress_queue.empty():
+                try: self._commit_progress_queue.get_nowait()
+                except queue.Empty: break
             self._approved_preflight_signature = None
             if error:
                 self.status_var.set(str(error))
@@ -3339,7 +3804,13 @@ class BranchSubmitWorkbench:
                 return
             self.current_batch = result
             self._render_target_statuses()
-            self.status_var.set(_format_batch_result(result).replace("\n", " · "))
+            finished = sum(
+                state in {"committed", "already_present", "already_applied", "skipped"}
+                for state in result.target_status.values()
+            )
+            self.status_var.set(
+                f"提交完成：当前分支 {result.source_branch}；目标分支 {finished}/{len(result.target_branches)}；已完成 {finished}，剩余 {max(0, len(result.target_branches) - finished)}"
+            )
             messagebox.showinfo("批次结果", _format_batch_result(result), parent=self.root)
             if result.superseded_by:
                 child_path = os.path.join(settings_dir(), "batches", result.superseded_by, "batch.json")
@@ -3348,7 +3819,12 @@ class BranchSubmitWorkbench:
                     self.status_var.set(f"已载入子批次 {result.superseded_by}；继续前请重新预检查")
             self._refresh_primary_button()
 
-        self.ui_tasks.submit(lambda _cancel_event: self.engine.commit(batch), done)
+        self.ui_tasks.submit(
+            lambda _cancel_event: self.engine.commit(
+                batch, progress=lambda value: self._commit_progress_queue.put({**value, "generation": progress_generation})
+            ),
+            done,
+        )
 
     def _submit_single_branch(self):
         """Use the native TortoiseSVN commit path when no target is selected."""
@@ -3380,6 +3856,10 @@ class BranchSubmitWorkbench:
 
         def done(exit_code, error, _generation):
             self._commit_active = False
+            self._commit_progress_generation += 1
+            while not self._commit_progress_queue.empty():
+                try: self._commit_progress_queue.get_nowait()
+                except queue.Empty: break
             if error:
                 self.status_var.set(str(error))
                 messagebox.showerror("单分支提交失败", str(error), parent=self.root)
@@ -3398,6 +3878,15 @@ class BranchSubmitWorkbench:
         self.ui_tasks.submit(worker, done)
 
     def _close(self):
+        if self._scan_active:
+            self._stop_scan()
+            return
+        if self._preflight_active:
+            self.ui_tasks.cancel(self._preflight_generation)
+            self._preflight_cancel_requested = True
+            self.status_var.set("正在取消预检查；等待后台任务结束…")
+            self._refresh_primary_button()
+            return
         if self._commit_active:
             self.status_var.set("提交进行中，当前窗口不能关闭；请等待 TortoiseSVN 对账完成")
             return
@@ -3447,7 +3936,11 @@ def launch_ui(initial_paths: Iterable[str] | None = None) -> None:
             action, batch = choice
             engine = BranchSubmitEngine(batch.wc_root)
             if action == "restore":
-                engine.restore_uncommitted(batch); messagebox.showinfo("恢复结果", _format_batch_result(batch), parent=root)
+                state = _restore_batch_with_progress(root, engine, batch)
+                if state.get("error"):
+                    messagebox.showerror("恢复失败", str(state["error"]), parent=root)
+                else:
+                    messagebox.showinfo("恢复结果", _format_batch_result(batch), parent=root)
             elif action == "abandon":
                 engine.abandon(batch)
             elif action == "continue":

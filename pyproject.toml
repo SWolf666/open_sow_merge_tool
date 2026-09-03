@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sow-merge-tool"
-version = "2026.08.17.90"
+version = "2026.09.03.91"
 description = "Excel semantic merge and recoverable multi-branch SVN submission tool"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
 dev = [
   "pytest>=8,<10",
   "pytest-timeout>=2,<3",
+  "psutil>=5,<8",
   "ruff>=0.9,<1",
   "pyinstaller==6.22.0",
 ]

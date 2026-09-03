@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import tkinter as tk
+from tkinter import ttk
 
 import pytest
 
@@ -77,6 +79,29 @@ def test_every_native_status_has_an_explicit_policy(
 
 def test_native_status_enum_is_fully_accounted_for():
     assert set(sp.STATUS_NAMES.values()) == ALL_NATIVE_STATUSES
+
+
+def test_workbench_root_enter_excludes_message_and_search_inputs():
+    app = object.__new__(bs.BranchSubmitWorkbench)
+    app.tk = tk
+    app.ttk = ttk
+    app.message = object()
+    app._keyboard_search_entry = object()
+    app.source_box = object()
+    calls = []
+    class Button:
+        def instate(self, _state):
+            return True
+    app.submit_button = Button()
+    app.preflight_button = Button()
+    app._submit = lambda: calls.append("submit")
+    app._preflight = lambda: calls.append("preflight")
+    assert app._root_enter(type("Event", (), {"widget": app.message})()) is None
+    assert app._root_enter(type("Event", (), {"widget": app._keyboard_search_entry})()) == "break"
+    assert app._root_enter(type("Event", (), {"widget": app.source_box})()) == "break"
+    assert calls == []
+    assert app._root_enter(type("Event", (), {"widget": object()})()) == "break"
+    assert calls == ["submit"]
 
 
 @pytest.mark.parametrize(

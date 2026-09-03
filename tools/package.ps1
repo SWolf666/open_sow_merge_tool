@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = '',
-  [string]$Version = '2026-08-17.update90'
+  [string]$Version = '2026-09-03.update91'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,8 +15,14 @@ $release = Join-Path $repo "artifacts\release\$slug"
 if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $release | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $release 'sow_merge_tool.exe')
-foreach ($file in @('安装.bat','卸载.bat','使用说明.md')) {
-  Copy-Item -LiteralPath (Join-Path $repo $file) -Destination (Join-Path $release $file)
+$releaseFiles = @()
+# Resolve owned documentation/scripts by extension and size so this remains
+# reliable under legacy Windows PowerShell code pages.
+$releaseFiles += @(Get-ChildItem -LiteralPath $repo -File -Filter '*.bat')
+$markdownFiles = @(Get-ChildItem -LiteralPath $repo -File -Filter '*.md' | Sort-Object Length)
+if ($markdownFiles.Count -ge 2) { $releaseFiles += $markdownFiles[1] }
+foreach ($file in $releaseFiles) {
+  Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $release $file.Name)
 }
 $hash = (Get-FileHash -LiteralPath (Join-Path $release 'sow_merge_tool.exe') -Algorithm SHA256).Hash
 Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Value "$hash  sow_merge_tool.exe" -Encoding ASCII
@@ -24,7 +30,7 @@ $manifest = [ordered]@{
   version = $Version
   package = "sow_merge_tool_$slug.zip"
   directory = $slug
-  files = @('sow_merge_tool.exe','安装.bat','卸载.bat','使用说明.md','SHA256SUMS.txt')
+  files = @('sow_merge_tool.exe') + @($releaseFiles.Name) + @('SHA256SUMS.txt')
   sha256 = $hash
   generatedAt = (Get-Date).ToUniversalTime().ToString('o')
 }

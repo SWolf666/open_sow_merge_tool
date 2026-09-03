@@ -10,8 +10,11 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import difflib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,148 @@ class UiTheme:
 
 
 THEME = UiTheme()
+
+
+class DifferenceKind(str, Enum):
+    """Stable, presentation-independent difference categories."""
+
+    CONFLICT = "conflict"
+    MODIFIED = "modified"
+    ADDED = "added"
+    DELETED = "deleted"
+    STRUCTURE = "structure"
+    PROCESSED = "processed"
+
+    @property
+    def label(self) -> str:
+        return {
+            self.CONFLICT: "冲突",
+            self.MODIFIED: "修改",
+            self.ADDED: "增行",
+            self.DELETED: "删行",
+            self.STRUCTURE: "结构变化",
+            self.PROCESSED: "已处理",
+        }[self]
+
+
+@dataclass(frozen=True)
+class DifferenceItem:
+    """Read-only row consumed by a difference browser.
+
+    The model deliberately carries no workbook objects.  It can therefore be
+    indexed, filtered and rendered on the UI thread without causing another
+    workbook scan or keeping a mutable worksheet alive.
+    """
+
+    id: str
+    sheet: str
+    kind: DifferenceKind | str
+    location: str = ""
+    row: int | None = None
+    column: int | None = None
+    summary: str = ""
+    role: str = ""
+    processed: bool = False
+    conflict: bool = False
+    base_value: object = None
+    mine_value: object = None
+    theirs_value: object = None
+    source_side: str = "mine"
+    target_side: str = "theirs"
+    base_label: str = "Base"
+    mine_label: str = "Mine"
+    theirs_label: str = "Theirs"
+    payload: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        raw_kind = str(self.kind).lower()
+        aliases = {"insert": "added", "add": "added", "delete": "deleted", "remove": "deleted", "column": "structure", "sheet": "structure"}
+        kind = self.kind if isinstance(self.kind, DifferenceKind) else DifferenceKind(aliases.get(raw_kind, raw_kind))
+        object.__setattr__(self, "kind", kind)
+
+    @property
+    def kind_label(self) -> str:
+        return self.kind.label
+
+    @property
+    def display_location(self) -> str:
+        if self.location:
+            return self.location
+        if self.row is None:
+            return ""
+        return f"第 {self.row} 行" if self.column is None else f"第 {self.row} 行 · 第 {self.column} 列"
+
+    @property
+    def status_label(self) -> str:
+        return "已处理" if self.processed else ("待处理" if self.conflict or self.kind != DifferenceKind.PROCESSED else "已处理")
+
+    @property
+    def character_diff(self) -> tuple[tuple[str, str], ...]:
+        """Character-level opcodes for the current values, suitable for Tk tags."""
+        values = {"base": self.base_value, "mine": self.mine_value, "theirs": self.theirs_value}
+        left = str(values.get(self.source_side) if values.get(self.source_side) is not None else "")
+        right = str(values.get(self.target_side) if values.get(self.target_side) is not None else "")
+        return tuple((tag, "".join(left[i1:i2]) + "→" + "".join(right[j1:j2])) for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, left, right).get_opcodes() if tag != "equal")
+
+
+@dataclass(frozen=True)
+class CommandState:
+    """Centralized command availability for both workbenches."""
+
+    busy: bool = False
+    ready: bool = True
+    has_selection: bool = False
+    has_unsaved_changes: bool = False
+    has_conflicts: bool = False
+    can_save: bool = False
+    can_undo: bool = False
+
+    def enabled(self, command: str) -> bool:
+        name = str(command).lower().replace(" ", "_")
+        if self.busy:
+            return name in {"cancel", "stop", "help"}
+        rules = {
+            "save": self.can_save and self.has_unsaved_changes,
+            "save_as": self.can_save,
+            "save_merged": self.can_save,
+            "undo": self.can_undo,
+            "apply": self.ready and self.has_selection and not self.has_conflicts,
+            "apply_source": self.ready and self.has_selection,
+            "retain": self.ready and self.has_selection,
+            "base": self.ready and self.has_selection,
+            "adopt": self.ready and self.has_selection,
+            "compare": self.ready,
+            "navigate": self.ready,
+            "previous": self.ready,
+            "next": self.ready,
+            "search": self.ready,
+            "filter": self.ready,
+            "shortcut": not self.busy,
+        }
+        return bool(rules.get(name, self.ready))
+
+
+def compact_path(path: str | None, limit: int = 72) -> str:
+    """Keep role and filename visible while exposing the full path elsewhere."""
+
+    value = str(path or "")
+    if len(value) <= limit:
+        return value
+    head = max(12, limit // 2 - 2)
+    tail = max(16, limit - head - 3)
+    return f"{value[:head]}…{value[-tail:]}"
+
+
+def set_widget_busy(widget: Any, busy: bool) -> None:
+    """Best-effort shared busy-state helper for ttk and classic Tk widgets."""
+
+    try:
+        if hasattr(widget, "state"):
+            widget.state(["disabled" if busy else "!disabled"])
+        else:
+            widget.configure(state="disabled" if busy else "normal")
+    except Exception:
+        pass
 
 
 def configure_ttk_style(root, *, theme: UiTheme = THEME):

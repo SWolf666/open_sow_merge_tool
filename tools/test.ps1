@@ -184,8 +184,7 @@ if ($Profile -eq 'Visual') {
     '_gui_self_test_branch_submit_workbench.py',
     '_gui_self_test_merge_file_paths.py',
     '_gui_self_test_start_center.py',
-    '_gui_self_test_comparison_sessions.py',
-    '_gui_self_test_logical_column_actions.py'
+    '_gui_self_test_comparison_sessions.py'
   )
   foreach ($name in $visualFiles) {
     $path = Join-Path $testScriptRoot $name

@@ -792,7 +792,7 @@ class BranchSubmitEngine:
             else read_svn_log if self.require_remote_freshness
             else None
         )
-        self._fast_delta_cache: dict[tuple[str, str], object] = {}
+        self._fast_delta_cache: dict[tuple[str, str, str, str, int | None], object] = {}
 
     def _status_snapshot(self, path: str, *, remote: bool = False) -> list[SvnStatusRecord]:
         """Read a status snapshot, asking SVN for repository freshness when needed."""
@@ -927,6 +927,31 @@ class BranchSubmitEngine:
             self.core = core
         return self.core
 
+    def _source_delta_for_plan(self, plan: FilePlan):
+        """Reuse one source index/delta for all target branches.
+
+        The key includes both captured content hashes and the source BASE
+        revision.  A path-only cache could reuse a stale delta after a branch
+        update replaced bytes while preserving a filename or timestamp.
+        """
+        cache_key = (
+            plan.source_before,
+            plan.source_after,
+            plan.source_before_hash,
+            plan.source_after_hash,
+            plan.source_revision,
+        )
+        delta = self._fast_delta_cache.get(cache_key)
+        if delta is None:
+            delta = fast_analyze_source(
+                plan.source_before,
+                plan.source_after,
+                before_revision=plan.source_revision,
+                source_revision=plan.source_revision,
+            )
+            self._fast_delta_cache[cache_key] = delta
+        return delta
+
     @staticmethod
     def _default_runner(args, *, timeout=300):
         return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout, check=False)
@@ -1026,12 +1051,8 @@ class BranchSubmitEngine:
             and _sha256(action.preview_path) == action.preview_hash
         ):
             return action.preview_path
-        cache_key = (plan.source_before, plan.source_after)
-        delta = self._fast_delta_cache.get(cache_key)
-        if delta is None:
-            delta = fast_analyze_source(plan.source_before, plan.source_after)
-            self._fast_delta_cache[cache_key] = delta
-        decision = fast_analyze_target(delta, target_path)
+        delta = self._source_delta_for_plan(plan)
+        decision = fast_analyze_target(delta, target_path, target_revision=record.revision)
         plan.target_summaries[target] = dict(decision.summary)
         plan.target_details[target] = list(decision.details)
         if decision.disposition == "already_applied":
@@ -1048,6 +1069,8 @@ class BranchSubmitEngine:
             # The preview is hypothetical and is specifically used to decide
             # whether an overlapping source change should be accepted.
             confirmed=decision.disposition == "confirmation_required",
+            source_revision=plan.source_revision,
+            target_revision=record.revision,
         )
         action.preview_path = preview
         action.preview_hash = _sha256(preview)
@@ -1336,12 +1359,8 @@ class BranchSubmitEngine:
         # a source-branch submission blocker.  Candidate materialization is
         # deferred until the target is actually processed.
         try:
-            cache_key = (plan.source_before, plan.source_after)
-            delta = getattr(self, "_fast_delta_cache", {}).get(cache_key)
-            if delta is None:
-                delta = fast_analyze_source(plan.source_before, plan.source_after)
-                self._fast_delta_cache[cache_key] = delta
-            decision = fast_analyze_target(delta, target_path)
+            delta = self._source_delta_for_plan(plan)
+            decision = fast_analyze_target(delta, target_path, target_revision=action.revision_before)
         except Exception as exc:
             action.disposition = "unsupported"
             action.state, action.reason = "blocked", f"源修改分析失败，已安全阻断：{exc}"
@@ -1765,12 +1784,8 @@ class BranchSubmitEngine:
         current_hash = _sha256(target_path)
         action.target_before_hash = current_hash
         try:
-            cache_key = (plan.source_before, plan.source_after)
-            delta = self._fast_delta_cache.get(cache_key)
-            if delta is None:
-                delta = fast_analyze_source(plan.source_before, plan.source_after)
-                self._fast_delta_cache[cache_key] = delta
-            decision = fast_analyze_target(delta, target_path)
+            delta = self._source_delta_for_plan(plan)
+            decision = fast_analyze_target(delta, target_path, target_revision=action.revision_before)
             plan.target_summaries[target] = dict(decision.summary)
             plan.target_details[target] = list(decision.details)
             action.disposition = decision.disposition
@@ -1805,6 +1820,8 @@ class BranchSubmitEngine:
                         candidate_copy,
                         decision,
                         confirmed=decision.disposition == "confirmation_required",
+                        source_revision=plan.source_revision,
+                        target_revision=action.revision_before,
                     )
                 action.candidate_path, action.candidate_hash = candidate_copy, _sha256(candidate_copy)
                 action.state = "ready"

@@ -10,6 +10,7 @@ copy derived from the target workbook into the batch artifact directory.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -54,7 +55,7 @@ class FastSheet:
 @dataclass
 class FastWorkbook:
     path: str
-    signature: tuple[str, int, int]
+    signature: tuple[str, str, int | None]
     members: dict[str, tuple[int, int]]
     payloads: dict[str, bytes]
     sheets: dict[str, FastSheet]
@@ -69,6 +70,8 @@ class FastSourceDelta:
     unsupported_reason: str = ""
     incoming_count: int = 0
     changed_count: int = 0
+    before_revision: int | None = None
+    source_revision: int | None = None
 
 
 @dataclass
@@ -79,9 +82,20 @@ class FastTargetDecision:
     details: list[dict] = field(default_factory=list)
 
 
-def _signature(path: str) -> tuple[str, int, int]:
+@lru_cache(maxsize=256)
+def _content_digest(path: str, size: int, modified_ns: int) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _signature(path: str, revision: int | None = None) -> tuple[str, str, int | None]:
     info = os.stat(path)
-    return os.path.normcase(os.path.abspath(path)), int(info.st_size), int(info.st_mtime_ns)
+    absolute = os.path.normcase(os.path.abspath(path))
+    digest = _content_digest(absolute, int(info.st_size), int(info.st_mtime_ns))
+    return absolute, digest, None if revision is None else int(revision)
 
 
 def _text(node: ET.Element | None) -> str:
@@ -188,7 +202,7 @@ def _sheet_map(payloads: dict[str, bytes]) -> dict[str, str]:
 
 
 @lru_cache(maxsize=32)
-def _load_cached(signature: tuple[str, int, int]) -> FastWorkbook:
+def _load_cached(signature: tuple[str, str, int | None]) -> FastWorkbook:
     path = signature[0]
     with zipfile.ZipFile(path, "r") as package:
         names = [name for name in package.namelist() if not name.endswith("/")]
@@ -227,8 +241,9 @@ def _zip_infos(path: str):
         return [(info.filename, info) for info in package.infolist() if not info.filename.endswith("/")]
 
 
-def load_workbook_index(path: str) -> FastWorkbook:
-    return _load_cached(_signature(path))
+def load_workbook_index(path: str, *, revision: int | None = None) -> FastWorkbook:
+    """Load one immutable index keyed by bytes, mtime and optional SVN rev."""
+    return _load_cached(_signature(path, revision))
 
 
 def _cell_equal(left: FastCell | None, right: FastCell | None) -> bool:
@@ -460,10 +475,21 @@ def _source_structure_issue(before: FastWorkbook, after: FastWorkbook) -> str:
     return ""
 
 
-def analyze_source(before_path: str, source_path: str) -> FastSourceDelta:
-    before = load_workbook_index(before_path)
-    after = load_workbook_index(source_path)
-    delta = FastSourceDelta(source_path, before_path)
+def analyze_source(
+    before_path: str,
+    source_path: str,
+    *,
+    before_revision: int | None = None,
+    source_revision: int | None = None,
+) -> FastSourceDelta:
+    before = load_workbook_index(before_path, revision=before_revision)
+    after = load_workbook_index(source_path, revision=source_revision)
+    delta = FastSourceDelta(
+        source_path,
+        before_path,
+        before_revision=before_revision,
+        source_revision=source_revision,
+    )
     if set(before.sheets) != set(after.sheets):
         delta.unsupported_reason = "工作表结构发生变化"
         return delta
@@ -497,14 +523,19 @@ def analyze_source(before_path: str, source_path: str) -> FastSourceDelta:
     return delta
 
 
-def analyze_target(delta: FastSourceDelta, target_path: str) -> FastTargetDecision:
+def analyze_target(
+    delta: FastSourceDelta,
+    target_path: str,
+    *,
+    target_revision: int | None = None,
+) -> FastTargetDecision:
     if delta.unsupported_reason:
         return FastTargetDecision("unsupported", delta.unsupported_reason)
-    before = load_workbook_index(delta.before_path)
-    source = load_workbook_index(delta.source_path)
+    before = load_workbook_index(delta.before_path, revision=delta.before_revision)
+    source = load_workbook_index(delta.source_path, revision=delta.source_revision)
     # Classification is read-only.  Candidate writing later reuses the target
     # package and replaces only worksheet payloads that receive source changes.
-    target = load_workbook_index(target_path)
+    target = load_workbook_index(target_path, revision=target_revision)
     details: list[dict] = []
     for sheet_name, changes in delta.changed_sheets.items():
         source_sheet = source.sheets[sheet_name]
@@ -633,6 +664,7 @@ def analyze_target(delta: FastSourceDelta, target_path: str) -> FastTargetDecisi
 
 def cache_clear() -> None:
     _load_cached.cache_clear()
+    _content_digest.cache_clear()
 
 
 def apply_source_change_plan(
@@ -643,6 +675,8 @@ def apply_source_change_plan(
     decision: FastTargetDecision,
     *,
     confirmed: bool = False,
+    source_revision: int | None = None,
+    target_revision: int | None = None,
 ) -> None:
     """Apply the source delta to a target-derived candidate.
 
@@ -658,8 +692,8 @@ def apply_source_change_plan(
     )
     if not allowed:
         raise ValueError(f"不能物化 {decision.disposition} 动作")
-    source = load_workbook_index(source_path)
-    target = load_workbook_index(target_path)
+    source = load_workbook_index(source_path, revision=source_revision)
+    target = load_workbook_index(target_path, revision=target_revision)
     changed_payloads: dict[str, bytes] = {}
     by_sheet: dict[str, list[dict]] = {}
     for detail in decision.details:

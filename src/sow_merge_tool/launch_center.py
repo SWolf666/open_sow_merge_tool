@@ -225,6 +225,22 @@ class ComparisonSessionManager:
             except (AttributeError, OSError):
                 pass
 
+    def resume(self, root=None) -> None:
+        """Resume monitoring a live child after the pairing list is reopened.
+
+        Closing the list intentionally only stops Tk polling; it does not
+        terminate the comparison process.  The start centre calls this method
+        when the list is shown again so the same session can finish and update
+        its row state.  Keeping the operation on the manager (rather than on
+        the list model) also makes the window lifecycle safe for the real Tk
+        path and for headless callers.
+        """
+        if root is not None:
+            self.root = root
+        self._closed = False
+        if self._active_session is not None:
+            self._schedule_poll()
+
 
 @dataclass
 class ComparisonRow:
@@ -320,11 +336,7 @@ class ComparisonListModel:
 
     def resume(self, root=None) -> None:
         """Resume polling an existing child when the pairing list is reopened."""
-        if root is not None:
-            self.root = root
-        self._closed = False
-        if self._active_session is not None:
-            self._schedule_poll()
+        self.manager.resume(root)
 
 
 def _status_text(status: PairStatus) -> str:

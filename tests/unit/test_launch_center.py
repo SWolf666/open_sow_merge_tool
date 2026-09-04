@@ -25,6 +25,20 @@ class _FakeProcess:
         self.returncode = -15
 
 
+class _FakeRoot:
+    def __init__(self):
+        self.after_calls = []
+        self.cancelled = []
+
+    def after(self, delay, callback):
+        token = f"after-{len(self.after_calls) + 1}"
+        self.after_calls.append((token, delay, callback))
+        return token
+
+    def after_cancel(self, token):
+        self.cancelled.append(token)
+
+
 def test_comparison_command_is_direct_and_role_explicit(monkeypatch, tmp_path):
     monkeypatch.setattr("sow_merge_tool.launch_center.sys.frozen", False, raising=False)
     left = tmp_path / "Source 中文.xlsx"
@@ -75,6 +89,29 @@ def test_session_manager_start_failure_is_explicit_and_close_keeps_child():
     assert running is not None and running.state == "比较中"
     assert not process.terminated
     assert set(COMPARISON_STATES) == {"未打开", "启动中", "比较中", "已关闭", "启动失败"}
+
+
+def test_session_manager_resume_restarts_polling_after_list_reopen():
+    root = _FakeRoot()
+    process = _FakeProcess()
+    manager = ComparisonSessionManager(root, popen_factory=lambda _command, **_kwargs: process)
+    session = manager.start("left.xlsx", "right.xlsx")
+    assert session is not None
+    first_token = root.after_calls[-1][0]
+
+    manager.close()
+    assert root.cancelled == [first_token]
+    assert not process.terminated
+
+    reopened_root = _FakeRoot()
+    manager.resume(reopened_root)
+    assert manager.root is reopened_root
+    assert len(reopened_root.after_calls) == 1
+    assert manager.active_session is session
+
+    process.returncode = 0
+    manager.poll_now()
+    assert session.state == "已关闭"
 
 
 def test_source_target_presentation_keeps_source_read_only_target_writable():

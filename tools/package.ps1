@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = '',
-  [string]$Version = '2026-09-04.update92'
+  [string]$Version = '2026-09-04.update93'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,8 +19,13 @@ $releaseFiles = @()
 # Resolve owned documentation/scripts by extension and size so this remains
 # reliable under legacy Windows PowerShell code pages.
 $releaseFiles += @(Get-ChildItem -LiteralPath $repo -File -Filter '*.bat')
-$markdownFiles = @(Get-ChildItem -LiteralPath $repo -File -Filter '*.md' | Sort-Object Length)
-if ($markdownFiles.Count -ge 2) { $releaseFiles += $markdownFiles[1] }
+$usageGuide = Join-Path $repo '使用说明.md'
+if (Test-Path -LiteralPath $usageGuide) {
+  $releaseFiles += Get-Item -LiteralPath $usageGuide
+} else {
+  $markdownFiles = @(Get-ChildItem -LiteralPath $repo -File -Filter '*.md' | Sort-Object Length)
+  if ($markdownFiles.Count -ge 2) { $releaseFiles += $markdownFiles[1] }
+}
 foreach ($file in $releaseFiles) {
   Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $release $file.Name)
 }

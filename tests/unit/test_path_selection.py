@@ -3,15 +3,18 @@ from __future__ import annotations
 import os
 
 import pytest
+from openpyxl import Workbook
 
 from sow_merge_tool.path_selection import (
     DirectoryStatus,
     PairStatus,
     PathSelectionError,
     map_relative_files,
+    override_mapping,
     recheck_selection,
     snapshot_selection,
     validate_directory,
+    validate_excel_package,
     validate_file_pair,
 )
 
@@ -56,6 +59,26 @@ def test_directory_mapping_uses_relative_path_not_basename(tmp_path):
     assert statuses["b/配置.xlsx"] is PairStatus.MISSING_RIGHT
     assert statuses["other/配置.xlsx"] is PairStatus.MISSING_LEFT
     assert all("配置.xlsx" in item.relative_path for item in mappings)
+    assert all(item.left_path and item.right_path for item in mappings if item.complete)
+
+
+def test_missing_mapping_can_be_overridden_only_by_explicit_file(tmp_path):
+    left = _file(tmp_path / "source" / "config" / "Alpha.xlsx", b"left")
+    right = tmp_path / "target" / "renamed" / "Beta.xlsx"
+    _file(right, b"right")
+    mapping = next(
+        item for item in map_relative_files(left.parents[1], right.parents[1])
+        if item.relative_path == "config/Alpha.xlsx"
+    )
+    assert mapping.status is PairStatus.MISSING_RIGHT
+    replaced = override_mapping(mapping, right_path=right)
+    assert replaced.right_path == str(right)
+    assert replaced.status is PairStatus.MATCHED
+
+    matching = _file(tmp_path / "target" / "renamed" / "Alpha.xlsx", b"right")
+    replaced = override_mapping(mapping, right_path=matching)
+    assert replaced.status is PairStatus.SAME_NAME_DIFFERENT_PATH
+    assert replaced.complete
 
 
 def test_directory_validation_allows_normal_directory_and_rejects_reparse(tmp_path, monkeypatch):
@@ -78,3 +101,17 @@ def test_hash_recheck_is_read_only_and_fails_closed_on_drift(tmp_path):
     with pytest.raises(PathSelectionError, match="发生变化"):
         recheck_selection(snapshot)
     assert os.path.isfile(left)
+
+
+def test_excel_package_validation_is_deferred_and_clear(tmp_path):
+    valid = tmp_path / "valid.xlsx"
+    workbook = Workbook()
+    workbook.active["A1"] = "ok"
+    workbook.save(valid)
+    workbook.close()
+    validate_excel_package(valid)
+
+    broken = tmp_path / "broken.xlsx"
+    broken.write_bytes(b"not zip")
+    with pytest.raises(PathSelectionError, match="损坏"):
+        validate_excel_package(broken)

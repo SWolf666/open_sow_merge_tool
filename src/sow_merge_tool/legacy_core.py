@@ -57,7 +57,7 @@ from .difference_browser import DifferenceBrowser
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-04.update92"
+APP_VERSION = "2026-09-04.update93"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -10208,6 +10208,8 @@ class RolePresentation:
     @classmethod
     def for_app(cls, app) -> "RolePresentation":
         context = getattr(app, "launch_context", None)
+        if getattr(app, "role_mode", "") == "source-target":
+            return cls("Source", "Source", "Target", "source", "source", "target")
         if getattr(app, "merge_mode", False) and getattr(app, "has_base", False):
             return cls(
                 merge_role_label(context, "mine"),
@@ -13386,12 +13388,17 @@ class SheetView:
             label_base = f"base={self._source_display_name(base_src)}" if base_src else "base=-"
             label_b = f"theirs={self._source_display_name(theirs_src)}"
         else:
-            # Diff mode: keep wording consistent with SVN semantics (left=base, right=mine).
             base_src = getattr(self.app, "raw_base", None) or self.app.file_a
             mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
-            label_a = f"base={self._source_display_name(base_src)}"
-            label_b = f"mine={self._source_display_name(mine_src)}"
-            label_base = f"base={self._source_display_name(getattr(self.app, 'base_path', '') or '')}"
+            if getattr(self.app, "role_mode", "") == "source-target":
+                label_a = f"Source（只读）={self._source_display_name(base_src)}"
+                label_b = f"Target（可保存）={self._source_display_name(mine_src)}"
+                label_base = f"Source={self._source_display_name(base_src)}"
+            else:
+                # Diff mode: keep wording consistent with SVN semantics (left=base, right=mine).
+                label_a = f"base={self._source_display_name(base_src)}"
+                label_b = f"mine={self._source_display_name(mine_src)}"
+                label_base = f"base={self._source_display_name(getattr(self.app, 'base_path', '') or '')}"
         is_merge_labels = bool(getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False))
         path_bg_a = _MINE_BG if is_merge_labels else _BASE_BG
         path_bg_b = _THEIRS_BG if is_merge_labels else _MINE_BG
@@ -14784,8 +14791,11 @@ class SheetView:
                 context = getattr(self.app, "launch_context", None)
                 base_identity = context.identity_for("base") if context else None
                 mine_identity = context.identity_for("mine") if context else None
-                base_label = merge_role_label(context, "base")
-                mine_label = merge_role_label(context, "mine")
+                if getattr(self.app, "role_mode", "") == "source-target":
+                    base_label, mine_label = "Source（只读）", "Target（可保存）"
+                else:
+                    base_label = merge_role_label(context, "base")
+                    mine_label = merge_role_label(context, "mine")
                 base_src = getattr(self.app, "raw_base", None) or self.app.file_a
                 mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
                 left_text = (
@@ -30551,7 +30561,8 @@ class SowMergeApp:
                  merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False,
                  raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None,
                  launch_context: MergeLaunchContext | None = None,
-                 startup_outcome: StartupMergeOutcome | None = None):
+                 startup_outcome: StartupMergeOutcome | None = None,
+                 role_mode: str = ""):
         # Sequential GUI instances are common in smoke tests and can also occur
         # in host integrations. Collect destroyed Tk object cycles on the UI
         # thread before any new background XML parser can trigger that GC.
@@ -30591,6 +30602,7 @@ class SowMergeApp:
         self.raw_base = raw_base
         self.raw_mine = raw_mine
         self.raw_theirs = raw_theirs
+        self.role_mode = str(role_mode or "")
         self.diff_base_mine_mode = bool(
             not self.merge_mode and self.raw_base and self.raw_mine
         )
@@ -38151,6 +38163,11 @@ def main():
             action="store_true",
             help="打开 Excel 文件比较/合并启动中心，并将显式路径仅作为预填",
         )
+        parser.add_argument(
+            "--source-target",
+            action="store_true",
+            help="将两个直接路径作为只读 Source 与可保存 Target 打开",
+        )
         parser.add_argument("--textdiff", action="store_true", help="Only generate text files and open TortoiseMerge")
         parser.add_argument(
             "--branch-submit",
@@ -38307,9 +38324,13 @@ def main():
             root.destroy()
             a = args.file_a
 
+        source_target_mode = bool(args.source_target)
         raw_base_arg = args.base
         raw_mine_arg = args.mine
         raw_theirs_arg = args.theirs
+        if source_target_mode and a and b:
+            raw_base_arg = a
+            raw_mine_arg = b
 
         # Preserve every sidecar exactly as TortoiseSVN supplied it.  In
         # particular, a cross-branch ``.merge-left.rN`` is source Base and must
@@ -38468,6 +38489,7 @@ def main():
             raw_mine=raw_mine_arg,
             raw_theirs=raw_theirs_arg,
             launch_context=two_way_context,
+            role_mode="source-target" if source_target_mode else "",
         )
         app.run()
 

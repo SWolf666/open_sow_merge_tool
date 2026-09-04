@@ -13,6 +13,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -100,6 +101,19 @@ class DirectoryValidation:
     def ready(self) -> bool:
         return self.status in {DirectoryStatus.NORMAL, DirectoryStatus.SVN_VALID}
 
+    @property
+    def comparison_allowed(self) -> bool:
+        """Compare-only policy: repository warnings do not block safe files."""
+        return self.status not in {
+            DirectoryStatus.MISSING,
+            DirectoryStatus.NOT_DIRECTORY,
+            DirectoryStatus.REPARSE,
+        }
+
+    @property
+    def warning(self) -> str:
+        return "; ".join(self.issues)
+
 
 @dataclass(frozen=True)
 class RelativeMapping:
@@ -142,6 +156,28 @@ def sha256_path(path: str | os.PathLike[str]) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def validate_excel_package(path: str | os.PathLike[str]) -> None:
+    """Validate the OOXML container at the final open boundary.
+
+    Directory indexing intentionally does not call this function.  It is a
+    cheap ZIP-member check used only after the user explicitly opens one row.
+    """
+    value = os.fspath(path)
+    try:
+        with zipfile.ZipFile(value, "r") as package:
+            names = set(package.namelist())
+            required = {"[Content_Types].xml", "xl/workbook.xml"}
+            if not required.issubset(names):
+                raise PathSelectionError(f"Excel 文件损坏或不是有效 OOXML 工作簿：{value}")
+            bad = package.testzip()
+            if bad:
+                raise PathSelectionError(f"Excel 文件损坏（ZIP 成员无法读取）：{bad}")
+    except PathSelectionError:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        raise PathSelectionError(f"Excel 文件损坏或不可读：{value}") from exc
 
 
 def _is_reparse(path: str) -> bool:
@@ -192,7 +228,10 @@ def inspect_path(path: str | os.PathLike[str], *, include_hash: bool = True) -> 
     else:
         kind = "other"
     extension = Path(value).suffix.lower() if kind == "file" else ""
-    digest = sha256_path(value) if include_hash and kind == "file" else None
+    try:
+        digest = sha256_path(value) if include_hash and kind == "file" else None
+    except OSError as exc:
+        raise PathSelectionError(f"文件不可读：{value}") from exc
     return PathProbe(
         path=value,
         exists=exists,
@@ -295,10 +334,8 @@ def validate_directory(
             status = DirectoryStatus.SVN_LAYOUT_INVALID
             issues.append(f"SVN 状态扫描失败：{exc}")
     if switched:
-        status = DirectoryStatus.SWITCHED
         issues.append("工作副本包含 switched 节点")
     if external:
-        status = DirectoryStatus.EXTERNAL
         issues.append("工作副本包含 svn:externals 节点")
     reparse_paths: list[str] = []
     for root, dirs, files in os.walk(value, followlinks=False):
@@ -308,7 +345,6 @@ def validate_directory(
                 reparse_paths.append(candidate)
         dirs[:] = [name for name in dirs if not _is_reparse(os.path.join(root, name))]
     if reparse_paths and reject_reparse:
-        status = DirectoryStatus.REPARSE
         issues.append("目录中包含 reparse/symlink 节点")
     return DirectoryValidation(
         value, status, repo, top_level, tuple(dict.fromkeys(issues)), tuple(reparse_paths)
@@ -338,27 +374,39 @@ def validate_file_pair(
     right_path: str | os.PathLike[str],
     *,
     expected_repository: RepositoryIdentity | None = None,
+    include_hash: bool = True,
+    strict_repository: bool = False,
 ) -> FilePair:
-    left = inspect_path(left_path)
-    right = inspect_path(right_path)
+    left = inspect_path(left_path, include_hash=include_hash)
+    right = inspect_path(right_path, include_hash=include_hash)
     status, reason = _pair_reason(left, right)
     if status in {PairStatus.MATCHED, PairStatus.SAME_NAME_DIFFERENT_PATH}:
-        if expected_repository and left.repository and right.repository and left.repository.key != right.repository.key:
+        if strict_repository and expected_repository and left.repository and right.repository and left.repository.key != expected_repository.key:
             status, reason = PairStatus.TYPE_INCOMPATIBLE, "两侧不在同一 SVN 仓库"
-        elif expected_repository and (left.repository or right.repository) != expected_repository:
+        elif strict_repository and expected_repository and (left.repository or right.repository) != expected_repository:
             status, reason = PairStatus.TYPE_INCOMPATIBLE, "路径不属于预期 SVN 仓库"
     return FilePair(left, right, status, reason)
 
 
-def _iter_excel_files(directory: str) -> dict[str, str]:
+def _iter_excel_files(directory: str, *, excluded_paths: Iterable[str] = ()) -> dict[str, str]:
     result: dict[str, str] = {}
+    excluded = tuple(os.path.abspath(os.fspath(path)) for path in excluded_paths if path)
     for root, dirs, files in os.walk(directory, followlinks=False):
+        if any(_within(root, path) for path in excluded):
+            dirs[:] = []
+            continue
         dirs[:] = [name for name in dirs if name != ".svn" and not _is_reparse(os.path.join(root, name))]
+        dirs[:] = [
+            name for name in dirs
+            if not any(_within(os.path.join(root, name), path) for path in excluded)
+        ]
         for name in files:
             if Path(name).suffix.lower() not in SUPPORTED_EXCEL_EXTENSIONS:
                 continue
             path = os.path.join(root, name)
             if _is_reparse(path):
+                continue
+            if any(_within(path, excluded_path) for excluded_path in excluded):
                 continue
             relative = os.path.relpath(path, directory).replace("\\", "/")
             result[relative.casefold()] = path
@@ -370,6 +418,7 @@ def map_relative_files(
     right_directory: str | os.PathLike[str],
     *,
     relative_paths: Iterable[str] | None = None,
+    include_hash: bool = False,
 ) -> list[RelativeMapping]:
     """Map only equal relative paths; never select by basename alone."""
     left_validation = validate_directory(left_directory)
@@ -385,12 +434,14 @@ def map_relative_files(
             right_validation.issues + ("另一侧不是 SVN 工作副本，不能自动按仓库映射",),
             right_validation.reparse_paths,
         )
-    if not left_validation.ready or not right_validation.ready:
-            raise PathSelectionError(
-                "目录不能用于比较：" + "; ".join(left_validation.issues + right_validation.issues)
-            )
-    left_files = _iter_excel_files(left_validation.path)
-    right_files = _iter_excel_files(right_validation.path)
+    if not left_validation.comparison_allowed or not right_validation.comparison_allowed:
+        raise PathSelectionError(
+            "目录不能用于比较：" + "; ".join(left_validation.issues + right_validation.issues)
+        )
+    _left_switched, left_external = _svn_node_flags(left_validation.path)
+    _right_switched, right_external = _svn_node_flags(right_validation.path)
+    left_files = _iter_excel_files(left_validation.path, excluded_paths=left_external)
+    right_files = _iter_excel_files(right_validation.path, excluded_paths=right_external)
     keys = (
         {str(value).replace("\\", "/").casefold() for value in relative_paths}
         if relative_paths is not None
@@ -402,13 +453,29 @@ def map_relative_files(
         right = right_files.get(key)
         rel = (os.path.relpath(left or right or key, left_validation.path if left else right_validation.path)).replace("\\", "/")
         if left and right:
-            pair = validate_file_pair(left, right)
+            pair = validate_file_pair(left, right, include_hash=include_hash)
             result.append(RelativeMapping(rel, left, right, pair.status, pair.reason))
         elif left:
             result.append(RelativeMapping(rel, left, None, PairStatus.MISSING_RIGHT, "右侧缺少相同相对路径文件"))
         else:
             result.append(RelativeMapping(rel, None, right, PairStatus.MISSING_LEFT, "左侧缺少相同相对路径文件"))
     return result
+
+
+def override_mapping(
+    mapping: RelativeMapping,
+    *,
+    left_path: str | os.PathLike[str] | None = None,
+    right_path: str | os.PathLike[str] | None = None,
+) -> RelativeMapping:
+    """Apply an explicit per-row file choice without basename inference."""
+    left = os.fspath(left_path) if left_path is not None else mapping.left_path
+    right = os.fspath(right_path) if right_path is not None else mapping.right_path
+    if not left or not right:
+        status = PairStatus.MISSING_LEFT if not left else PairStatus.MISSING_RIGHT
+        return RelativeMapping(mapping.relative_path, left, right, status, "仍缺少一侧明确文件")
+    pair = validate_file_pair(left, right, include_hash=False)
+    return RelativeMapping(mapping.relative_path, pair.left.path, pair.right.path, pair.status, pair.reason)
 
 
 def snapshot_selection(
@@ -463,9 +530,11 @@ __all__ = [
     "inspect_path",
     "map_relative_files",
     "normalize_path",
+    "override_mapping",
     "recheck_selection",
     "sha256_path",
     "snapshot_selection",
     "validate_directory",
+    "validate_excel_package",
     "validate_file_pair",
 ]

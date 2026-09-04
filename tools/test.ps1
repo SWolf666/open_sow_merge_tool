@@ -130,6 +130,8 @@ if ($Profile -eq 'Native') {
   if ($LASTEXITCODE -ne 0) { throw "Native merge-path GUI test failed with exit code $LASTEXITCODE" }
   & $python (Join-Path $testScriptRoot '_gui_self_test_start_center.py')
   if ($LASTEXITCODE -ne 0) { throw "Native start-centre GUI test failed with exit code $LASTEXITCODE" }
+  & $python (Join-Path $testScriptRoot '_gui_self_test_comparison_sessions.py')
+  if ($LASTEXITCODE -ne 0) { throw "Native comparison-session GUI test failed with exit code $LASTEXITCODE" }
 }
 
 Write-Host "Test profile $Profile passed." -ForegroundColor Green

@@ -5,10 +5,17 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 import tkinter as tk
 from pathlib import Path
 
-from sow_merge_tool.launch_center import CompareSelectionDialog, StartCenter
+from openpyxl import Workbook
+
+from sow_merge_tool.launch_center import (
+    CompareSelectionDialog,
+    ComparisonSessionManager,
+    StartCenter,
+)
 
 
 def _labels(widget):
@@ -26,7 +33,10 @@ def _labels(widget):
 
 def _book(path: Path, payload: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    workbook = Workbook()
+    workbook.active["A1"] = payload.decode("utf-8")
+    workbook.save(path)
+    workbook.close()
 
 
 def main() -> None:
@@ -54,11 +64,22 @@ def main() -> None:
         _book(left, b"left")
         _book(right, b"right")
         captured = []
-        dialog = CompareSelectionDialog(root, initial_paths=(str(left), str(right)), on_confirm=captured.append)
+        process = type("Process", (), {"poll": lambda self: None})()
+        manager = ComparisonSessionManager(
+            root,
+            popen_factory=lambda _command, **_kwargs: process,
+        )
+        dialog = CompareSelectionDialog(
+            root,
+            initial_paths=(str(left), str(right)),
+            on_confirm=captured.append,
+            manager=manager,
+        )
         root.update_idletasks()
         assert dialog.confirm_button.instate(["!disabled"])
         dialog.confirm_button.invoke()
         assert captured and captured[0].paths == (str(left), str(right))
+        assert dialog.win.winfo_exists(), "打开比较后配对列表必须保留"
 
         left_dir = temp_root / "folder-left"
         right_dir = temp_root / "folder-right"
@@ -69,15 +90,46 @@ def main() -> None:
             root,
             initial_paths=(str(left_dir), str(right_dir)),
             on_confirm=folder_result.append,
+            manager=ComparisonSessionManager(
+                root,
+                popen_factory=lambda _command, **_kwargs: type(
+                    "Process", (), {"poll": lambda self: None}
+                )(),
+            ),
         )
-        root.update_idletasks()
-        rows = folder_dialog.mapping_tree.get_children()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            root.update()
+            rows = folder_dialog.mapping_tree.get_children()
+            if rows:
+                break
+            time.sleep(0.02)
         assert rows
         folder_dialog.mapping_tree.selection_set(rows[0])
         folder_dialog._selection_changed()
         assert folder_dialog.confirm_button.instate(["!disabled"])
         folder_dialog.confirm_button.invoke()
         assert folder_result and folder_result[0].mapping.relative_path == "config/Alpha.xlsx"
+        assert folder_dialog.win.winfo_exists()
+        broken = temp_root / "broken.xlsx"
+        broken.write_bytes(b"not an OOXML workbook")
+        broken_dialog = CompareSelectionDialog(
+            root,
+            initial_paths=(str(broken), str(right)),
+            manager=ComparisonSessionManager(
+                root,
+                popen_factory=lambda _command, **_kwargs: type(
+                    "Process", (), {"poll": lambda self: None}
+                )(),
+            ),
+        )
+        root.update_idletasks()
+        broken_dialog.confirm_button.invoke()
+        assert broken_dialog.win.winfo_exists()
+        assert "损坏" in broken_dialog.status_var.get()
+        dialog._cancel()
+        folder_dialog._cancel()
+        broken_dialog._cancel()
     finally:
         try:
             root.destroy()

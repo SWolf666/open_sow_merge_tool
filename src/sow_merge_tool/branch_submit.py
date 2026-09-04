@@ -32,6 +32,7 @@ from typing import ClassVar
 from .fast_branch_merge import analyze_source as fast_analyze_source
 from .fast_branch_merge import analyze_target as fast_analyze_target
 from .fast_branch_merge import apply_source_change_plan
+from .svn_log_provider import SvnLogError, read_svn_log
 from .svn_status_provider import (
     SvnStatusRecord,
     records_by_path,
@@ -593,6 +594,10 @@ class BranchSubmitBatch:
     superseded_by: str = ""
     freshness: dict[str, dict] = field(default_factory=dict)
     target_update_scopes: dict[str, list[str]] = field(default_factory=dict)
+    # Structured repository history is audit evidence only.  It is kept apart
+    # from TortoiseSVN's recent-message convenience list and never drives a
+    # content-selection or merge decision.
+    svn_log: dict[str, dict] = field(default_factory=dict)
     journal: list[dict] = field(default_factory=list)
 
     @property
@@ -768,6 +773,7 @@ class BranchSubmitEngine:
         candidates: Iterable[BranchCandidate] | None = None,
         require_remote_freshness: bool = False,
         remote_status_scanner: Callable[[str], list[SvnStatusRecord]] | None = None,
+        log_provider: Callable | None = None,
     ):
         self.wc_root = os.path.abspath(wc_root)
         self.allowed_branches = tuple(allowed_branches) if allowed_branches is not None else None
@@ -777,6 +783,15 @@ class BranchSubmitEngine:
         self.candidates = list(candidates) if candidates is not None else None
         self.require_remote_freshness = bool(require_remote_freshness)
         self.remote_status_scanner = remote_status_scanner
+        # The visible workbench opts into the real provider through its strict
+        # remote-freshness mode.  Legacy/headless engines can leave it unset or
+        # inject a deterministic provider; this keeps old offline adapters free
+        # of an unexpected network call.
+        self.log_provider = (
+            log_provider if log_provider is not None
+            else read_svn_log if self.require_remote_freshness
+            else None
+        )
         self._fast_delta_cache: dict[tuple[str, str], object] = {}
 
     def _status_snapshot(self, path: str, *, remote: bool = False) -> list[SvnStatusRecord]:
@@ -1472,6 +1487,89 @@ class BranchSubmitEngine:
         scope = batch.scope_path if _is_within(batch.scope_path, os.path.join(batch.wc_root, batch.source_branch)) else os.path.join(batch.wc_root, batch.source_branch)
         return records_by_path(self.status_scanner(scope))
 
+    @staticmethod
+    def _structured_log_payload(entry) -> dict[str, object]:
+        if hasattr(entry, "to_dict"):
+            value = entry.to_dict()
+        elif isinstance(entry, dict):
+            value = entry
+        else:
+            try:
+                value = asdict(entry)
+            except TypeError:
+                value = {"value": repr(entry)}
+        try:
+            json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return {"value": repr(value)}
+        return value
+
+    def _record_structured_log(
+        self,
+        batch: BranchSubmitBatch,
+        *,
+        branch: str,
+        path: str,
+        phase: str,
+    ) -> dict[str, object] | None:
+        """Capture repository log evidence without making it a content gate.
+
+        The provider is deliberately optional for legacy/offline engines.  A
+        missing or failed log is recorded as ``unknown`` and the existing
+        hash/SVN-state reconciliation remains authoritative.  A no-target
+        batch skips this hook entirely, preserving native single-branch
+        commit behavior.
+        """
+        if not batch.target_branches or self.log_provider is None:
+            return None
+        evidence: dict[str, object] = {
+            "branch": branch,
+            "phase": phase,
+            "path": os.path.abspath(path),
+            "state": "unknown",
+            "reason": "",
+            "entries": [],
+            "revisions": [],
+        }
+        try:
+            try:
+                entries = self.log_provider(path, limit=50)
+            except TypeError:
+                # Keep simple injected providers compatible with the old
+                # ``provider(path)`` shape without hiding other failures.
+                entries = self.log_provider(path)
+            if entries is None:
+                raise RuntimeError("日志 provider 未返回结果")
+            serialized = [self._structured_log_payload(entry) for entry in entries]
+            revisions = sorted({
+                int(item["revision"])
+                for item in serialized
+                if str(item.get("revision", "")).strip().lstrip("-").isdigit()
+            }, reverse=True)
+            evidence["entries"] = serialized
+            evidence["revisions"] = revisions
+            evidence["state"] = "available" if serialized else "empty"
+            if not serialized:
+                evidence["reason"] = "仓库返回空日志"
+        except (OSError, RuntimeError, TypeError, ValueError, SvnLogError) as exc:
+            evidence["state"] = "unknown"
+            evidence["reason"] = f"{type(exc).__name__}: {exc}"
+        key = f"{branch}:{phase}"
+        batch.svn_log[key] = evidence
+        summary = {
+            name: evidence[name]
+            for name in ("branch", "phase", "path", "state", "reason", "revisions")
+        }
+        try:
+            batch.event("svn-log-audit", **summary)
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+            # Audit persistence must not turn an already reconciled commit into
+            # a second content decision.  Keep the in-memory evidence and log
+            # the persistence failure for the caller's diagnostic output.
+            _LOG.warning("无法保存 SVN 结构化日志审计：%s", exc)
+            evidence["journal_error"] = str(exc)
+        return evidence
+
     def _verify_source_before_commit(self, batch: BranchSubmitBatch) -> None:
         status_map = self._source_status_map(batch)
         for plan in batch.files:
@@ -1529,6 +1627,17 @@ class BranchSubmitEngine:
             else:
                 unknown += 1
         batch.source_revision_after = max(revisions, default=None)
+        source_scope = (
+            batch.scope_path
+            if _is_within(batch.scope_path, os.path.join(batch.wc_root, batch.source_branch))
+            else os.path.join(batch.wc_root, batch.source_branch)
+        )
+        self._record_structured_log(
+            batch,
+            branch=batch.source_branch,
+            path=source_scope,
+            phase="source-reconcile",
+        )
         return committed, pending, unknown
 
     def _create_committed_sub_batch(self, batch: BranchSubmitBatch) -> BranchSubmitBatch:
@@ -1779,6 +1888,12 @@ class BranchSubmitEngine:
             else:
                 unknown += 1
         batch.event("target-reconciled", target=target, committed=committed, pending=pending, unknown=unknown)
+        self._record_structured_log(
+            batch,
+            branch=target,
+            path=os.path.join(batch.wc_root, target),
+            phase="target-reconcile",
+        )
         return committed, pending, unknown
 
     def commit(self, batch: BranchSubmitBatch, *, stop_on_failure: bool = True, progress: Callable[[dict[str, object]], None] | None = None) -> BranchSubmitBatch:

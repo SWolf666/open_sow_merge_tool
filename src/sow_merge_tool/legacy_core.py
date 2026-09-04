@@ -38524,6 +38524,10 @@ def run_entrypoint() -> None:
         from sow_merge_tool.svn_status_provider import internal_status_entrypoint
 
         raise SystemExit(internal_status_entrypoint(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-log-query":
+        from sow_merge_tool.svn_log_provider import internal_log_entrypoint
+
+        raise SystemExit(internal_log_entrypoint(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-author-query":
         raise SystemExit(_run_tortoise_svn_author_probe_entrypoint(sys.argv[2:]))
     # The release is a windowed executable with no stdout/stderr console.

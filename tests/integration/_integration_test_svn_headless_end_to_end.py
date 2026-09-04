@@ -43,6 +43,7 @@ os.environ["PATH"] = os.fspath(SVN_BIN) + os.pathsep + os.environ.get("PATH", ""
 
 bs = importlib.import_module("sow_merge_tool.branch_submit")
 sp = importlib.import_module("sow_merge_tool.svn_status_provider")
+sl = importlib.import_module("sow_merge_tool.svn_log_provider")
 
 
 SVN = SVN_BIN / "svn.exe"
@@ -459,6 +460,92 @@ def run_real_repository_partial_selection_and_dirty_target(root: Path) -> None:
     assert _value(release / "PartialB.xlsx") == 5
 
 
+def run_real_repository_structured_log(root: Path) -> None:
+    """Exercise the read-only XML log provider against a local file:// repo."""
+    repository, url = _create_repository(root)
+    wc = root / "log-wc"
+    _checkout(f"{url}/sheets", wc)
+    source_file = wc / "develop" / "config" / "Modify.xlsx"
+    _book(source_file, 901, extra="structured-log")
+    commit = _run(
+        SVN,
+        "commit",
+        source_file,
+        "-m",
+        "structured-log-edit",
+        "--username",
+        "tester",
+        "--non-interactive",
+    )
+    assert commit.returncode == 0
+    entries = sl.read_svn_log(os.fspath(source_file), limit=10)
+    assert entries
+    latest = entries[0]
+    assert latest.revision > 0
+    assert latest.author == "tester"
+    assert latest.message == "structured-log-edit"
+    assert any(path.path.endswith("/develop/config/Modify.xlsx") for path in latest.changed_paths)
+
+    copied_url = f"{url}/sheets/release/config/LogCopy.xlsx"
+    _run(
+        SVN,
+        "copy",
+        f"{url}/sheets/develop/config/Modify.xlsx",
+        copied_url,
+        "-m",
+        "structured-log-copy",
+        "--username",
+        "tester",
+        "--non-interactive",
+    )
+    copied_entries = sl.read_svn_log(copied_url, limit=10)
+    assert copied_entries
+    copied_path = next(
+        path
+        for path in copied_entries[0].changed_paths
+        if path.path.endswith("/release/config/LogCopy.xlsx")
+    )
+    assert copied_path.action == "A"
+    assert copied_path.copyfrom_path.endswith("/develop/config/Modify.xlsx")
+    assert copied_path.copyfrom_revision is not None
+    # The provider is audit-only: reading a log must not alter the working
+    # copy or any workbook bytes.
+    assert _value(source_file) == 901
+    assert not (wc / "release" / "config" / "LogCopy.xlsx").exists()
+    assert repository.is_dir()
+
+
+def run_tortoise_runtime_structured_log(root: Path) -> None:
+    """Force the hidden TortoiseSVN runtime fallback when svn.exe is absent."""
+    if not sl._find_tortoise_bin():
+        print("SKIP TortoiseSVN runtime structured-log fallback (runtime unavailable)")
+        return
+    _repository, url = _create_repository(root)
+    wc = root / "tortoise-log-wc"
+    _checkout(f"{url}/sheets", wc)
+    source_file = wc / "develop" / "config" / "Modify.xlsx"
+    _book(source_file, 902, extra="tortoise-runtime-log")
+    _run(
+        SVN,
+        "commit",
+        source_file,
+        "-m",
+        "tortoise-runtime-log",
+        "--username",
+        "tester",
+        "--non-interactive",
+    )
+    original_find_cli = sl._find_svn_cli
+    sl._find_svn_cli = lambda: None
+    try:
+        entries = sl.read_svn_log(os.fspath(source_file), limit=10)
+    finally:
+        sl._find_svn_cli = original_find_cli
+    assert entries
+    assert entries[0].message == "tortoise-runtime-log"
+    assert entries[0].author == "tester"
+
+
 def main() -> None:
     test_root = Path(os.environ.get("SOW_TEST_TMPDIR") or tempfile.gettempdir())
     test_root.mkdir(parents=True, exist_ok=True)
@@ -474,6 +561,12 @@ def main() -> None:
     with _temporary_test_dir(test_root) as root:
         run_real_repository_partial_selection_and_dirty_target(root / "partial")
         print("PASS real SVN partial selection and dirty-target guard")
+    with _temporary_test_dir(test_root) as root:
+        run_real_repository_structured_log(root / "structured-log")
+        print("PASS real SVN structured log provider")
+    with _temporary_test_dir(test_root) as root:
+        run_tortoise_runtime_structured_log(root / "tortoise-log")
+        print("PASS TortoiseSVN runtime structured log fallback")
     print(f"headless SVN end-to-end tests passed with {SVN.name} { _run(SVN, '--version', '--quiet').stdout.strip() }")
 
 

@@ -13,6 +13,7 @@ a = Analysis(
     hiddenimports=[
         "sow_merge_tool.legacy_core",
         "sow_merge_tool.branch_submit",
+        "sow_merge_tool.svn_log_provider",
         "sow_merge_tool.svn_status_provider",
         "sow_merge_tool.ui_foundation",
         "sow_merge_tool.path_selection",

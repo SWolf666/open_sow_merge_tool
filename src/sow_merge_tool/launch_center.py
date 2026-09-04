@@ -296,7 +296,11 @@ class CompareSelectionDialog:
         self.win.title("Excel 文件比较 / 合并 · 配对列表")
         self.win.geometry("1080x650")
         self.win.minsize(820, 540)
-        self.win.transient(parent)
+        try:
+            if parent.winfo_viewable():
+                self.win.transient(parent)
+        except (AttributeError, self.tk.TclError):
+            pass
         self._build()
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
         self.win.deiconify()

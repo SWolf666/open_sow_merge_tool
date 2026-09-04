@@ -550,6 +550,9 @@ class BatchFileAction:
     manual_result: str = ""  # v3 state compatibility; no longer used by the workflow
     confirmed: bool = False
     confirmation_target_hash: str = ""
+    target_base_revision: int | None = None
+    target_remote_revision: int | None = None
+    update_scope: str = ""
 
 
 @dataclass
@@ -561,6 +564,9 @@ class FilePlan:
     source_before_hash: str = ""
     source_after_hash: str = ""
     source_revision: int | None = None
+    source_base_revision: int | None = None
+    source_remote_revision: int | None = None
+    source_freshness: str = "unknown"
     source_state: str = "planned"
     source_committed_revision: int | None = None
     actions: dict[str, BatchFileAction] = field(default_factory=dict)
@@ -585,6 +591,8 @@ class BranchSubmitBatch:
     error: str = ""
     abandoned: bool = False
     superseded_by: str = ""
+    freshness: dict[str, dict] = field(default_factory=dict)
+    target_update_scopes: dict[str, list[str]] = field(default_factory=dict)
     journal: list[dict] = field(default_factory=list)
 
     @property
@@ -653,6 +661,8 @@ _READ_ONLY_BATCH_EVENTS = {
     "source-change-confirmed",
     "target-file-excluded",
     "target-preview-created",
+    "source-freshness",
+    "target-freshness",
     "abandoned",
 }
 
@@ -756,6 +766,8 @@ class BranchSubmitEngine:
         runner: Callable | None = None,
         status_scanner: Callable[[str], list[SvnStatusRecord]] | None = None,
         candidates: Iterable[BranchCandidate] | None = None,
+        require_remote_freshness: bool = False,
+        remote_status_scanner: Callable[[str], list[SvnStatusRecord]] | None = None,
     ):
         self.wc_root = os.path.abspath(wc_root)
         self.allowed_branches = tuple(allowed_branches) if allowed_branches is not None else None
@@ -763,7 +775,136 @@ class BranchSubmitEngine:
         self.runner = runner or self._default_runner
         self.status_scanner = status_scanner or scan_status
         self.candidates = list(candidates) if candidates is not None else None
+        self.require_remote_freshness = bool(require_remote_freshness)
+        self.remote_status_scanner = remote_status_scanner
         self._fast_delta_cache: dict[tuple[str, str], object] = {}
+
+    def _status_snapshot(self, path: str, *, remote: bool = False) -> list[SvnStatusRecord]:
+        """Read a status snapshot, asking SVN for repository freshness when needed."""
+        scanner = self.remote_status_scanner if remote and self.remote_status_scanner else self.status_scanner
+        if remote and scanner is self.status_scanner:
+            try:
+                return scanner(path, remote=True)
+            except TypeError:
+                # Fixture scanners and third-party adapters historically take
+                # only ``path``.  Keep them usable; strict mode will still
+                # fail closed if they cannot provide remote evidence.
+                return scanner(path)
+        return scanner(path)
+
+    @staticmethod
+    def _remote_revision(record: SvnStatusRecord) -> int | None:
+        for value in (
+            getattr(record, "repository_revision", None),
+            getattr(record, "remote_revision", None),
+            getattr(record, "repository_changed_revision", None),
+        ):
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _freshness_evidence(
+        self,
+        *,
+        branch: str,
+        path: str,
+        record: SvnStatusRecord,
+        expected_revision: int | None,
+        phase: str,
+    ) -> dict[str, object]:
+        local_revision = record.revision if record.revision is not None else expected_revision
+        remote_revision = self._remote_revision(record)
+        if remote_revision is None and not self.require_remote_freshness:
+            state = "unverified"
+            reason = "当前适配器未提供远端 revision（兼容旧测试/离线适配器）"
+        elif remote_revision is None:
+            state = "unknown"
+            reason = "无法确认 SVN 服务器端 revision"
+        elif local_revision is None:
+            state = "unknown"
+            reason = "无法确认工作副本 BASE revision"
+        elif remote_revision > local_revision:
+            state = "behind"
+            reason = f"工作副本 BASE r{local_revision} 落后服务器 r{remote_revision}"
+        elif remote_revision == local_revision:
+            state = "fresh"
+            reason = f"工作副本与服务器均为 r{local_revision}"
+        else:
+            state = "inconsistent"
+            reason = f"工作副本 r{local_revision} 高于服务器证据 r{remote_revision}"
+        evidence = {
+            "branch": branch,
+            "path": os.path.abspath(path),
+            "phase": phase,
+            "base_revision": local_revision,
+            "remote_revision": remote_revision,
+            "state": state,
+            "reason": reason,
+        }
+        return evidence
+
+    def _check_source_freshness(
+        self,
+        batch: BranchSubmitBatch,
+        status_map: dict[str, SvnStatusRecord],
+    ) -> None:
+        """Source freshness is a hard gate; never run SVN Update on the source."""
+        for plan in batch.files:
+            path = os.path.join(batch.wc_root, batch.source_branch, *plan.relative_path.split("/"))
+            record = _status_for_exact_path(batch.wc_root, path, status_map)
+            evidence = self._freshness_evidence(
+                branch=batch.source_branch,
+                path=path,
+                record=record,
+                expected_revision=plan.source_revision,
+                phase="source",
+            )
+            batch.freshness[f"source:{plan.relative_path}"] = evidence
+            plan.source_base_revision = evidence["base_revision"]
+            plan.source_remote_revision = evidence["remote_revision"]
+            plan.source_freshness = str(evidence["state"])
+            batch.event("source-freshness", **evidence)
+            state = str(evidence["state"])
+            if state in {"behind", "unknown", "inconsistent"}:
+                raise RuntimeError(
+                    f"源分支 {batch.source_branch}/{plan.relative_path}：{evidence['reason']}；"
+                    "工具不会自动更新源分支，请先在 TortoiseSVN 中更新后重试"
+                )
+
+    def _check_target_freshness(
+        self,
+        batch: BranchSubmitBatch,
+        target: str,
+        status_map: dict[str, SvnStatusRecord],
+        *,
+        phase: str,
+    ) -> None:
+        """Record every selected target path's BASE/server evidence."""
+        for plan in batch.files:
+            path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
+            record = _status_for_exact_path(batch.wc_root, path, status_map)
+            evidence = self._freshness_evidence(
+                branch=target,
+                path=path,
+                record=record,
+                expected_revision=None,
+                phase=phase,
+            )
+            batch.freshness[f"{target}:{plan.relative_path}:{phase}"] = evidence
+            action = plan.actions.get(target)
+            if action is not None:
+                action.target_base_revision = evidence["base_revision"]
+                action.target_remote_revision = evidence["remote_revision"]
+                action.update_scope = action.update_scope or path
+            batch.event("target-freshness", **evidence)
+            state = str(evidence["state"])
+            if phase == "after-update" and state in {"behind", "unknown", "inconsistent"}:
+                raise RuntimeError(
+                    f"目标分支 {target}/{plan.relative_path}：更新后仍无法确认服务器最新状态（{evidence['reason']}）"
+                )
 
     def _load_core(self):
         if self.core is None:
@@ -1254,31 +1395,62 @@ class BranchSubmitEngine:
             for item in items:
                 batch.files.append(self._source_snapshot(batch, item))
             self._detect_rename_pairs(batch.files)
+            source_scope = batch.scope_path if _is_within(
+                batch.scope_path, os.path.join(batch.wc_root, batch.source_branch)
+            ) else os.path.join(batch.wc_root, batch.source_branch)
+            source_status = records_by_path(self._status_snapshot(source_scope, remote=True))
+            self._check_source_freshness(batch, source_status)
             target_maps: dict[str, dict[str, SvnStatusRecord]] = {}
             for target in targets:
                 target_scope = os.path.join(self.wc_root, target)
                 update_paths = self._target_update_paths(batch, target)
                 if not update_paths:
                     target_maps[target] = {}
+                    batch.target_update_scopes[target] = []
                     batch.event(
                         "target-update-skipped",
                         target=target,
                         reason="所选文件仅需源分支处理",
                     )
                     continue
-                before_update = records_by_path(self.status_scanner(target_scope))
+                batch.target_update_scopes[target] = list(update_paths)
+                before_update = records_by_path(self._status_snapshot(target_scope, remote=True))
                 self._verify_target_update_scope_clean(target, update_paths, before_update)
-                batch.event("target-update-start", target=target, paths=len(update_paths))
+                self._check_target_freshness(batch, target, before_update, phase="before-update")
+                batch.event(
+                    "target-update-start",
+                    target=target,
+                    paths=len(update_paths),
+                    update_scope=list(update_paths),
+                    side_effects="仅更新选中文件；新增项只更新已验证的父目录；不写入 Excel 内容",
+                )
                 try:
                     self._update(update_paths)
                 except Exception as exc:
                     raise RuntimeError(f"目标分支 {target} 更新失败或被取消：{exc}") from exc
                 batch.event("target-update-complete", target=target, paths=len(update_paths))
-                target_maps[target] = records_by_path(self.status_scanner(target_scope))
+                target_maps[target] = records_by_path(self._status_snapshot(target_scope, remote=True))
+                self._check_target_freshness(batch, target, target_maps[target], phase="after-update")
             blocked = False
             for plan in batch.files:
                 for target in targets:
                     action = self._preflight_target_action(batch, plan, target, target_maps[target])
+                    scopes = batch.target_update_scopes.get(target, [])
+                    action.update_scope = next(
+                        (
+                            scope for scope in scopes
+                            if os.path.normcase(os.path.abspath(scope)) == os.path.normcase(
+                                os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
+                            )
+                            or (
+                                plan.operation == "add"
+                                and os.path.normcase(os.path.abspath(scope)) == os.path.normcase(
+                                    os.path.dirname(os.path.join(batch.wc_root, target, *plan.relative_path.split("/")))
+                                )
+                            )
+                        ),
+                        "",
+                    )
                     plan.actions[target] = action
                     if action.state == "blocked":
                         blocked = True
@@ -2017,7 +2189,15 @@ class BranchSubmitWorkbench:
         self.closing = False
         self.current_batch = resume_batch
         self._loaded_resume_batch_id = resume_batch.batch_id if resume_batch else ""
-        self.engine = BranchSubmitEngine(context.wc_root, candidates=self.candidates)
+        # The visible workbench always requires repository freshness evidence;
+        # legacy/unit adapters can opt out through BranchSubmitEngine's
+        # compatibility default when they intentionally provide local-only
+        # fixture statuses.
+        self.engine = BranchSubmitEngine(
+            context.wc_root,
+            candidates=self.candidates,
+            require_remote_freshness=True,
+        )
         self.target_vars: dict[str, object] = {}
         self._target_selection: dict[str, bool] = {}
         self._target_rows: dict[str, str] = {}
@@ -3660,6 +3840,14 @@ class BranchSubmitWorkbench:
                     f"可直接 {states.count('ready')} · 需确认 {states.count('confirmation_required')} · "
                     f"阻断 {states.count('blocked')}"
                 )
+            scope_var = getattr(self, "_matrix_panel_scope", None)
+            if scope_var is not None:
+                scope_var.set(
+                    "；".join(
+                        f"{target}: {len(paths)} 个路径"
+                        for target, paths in batch.target_update_scopes.items()
+                    ) or "无目标更新（仅源分支原生提交）"
+                )
             state_labels = getattr(self, "_matrix_panel_state_labels", {
                 "ready": "可直接同步", "confirmation_required": "需人工确认", "blocked": "安全阻断",
                 "already_applied": "已包含修改", "excluded": "目标不处理", "prepared": "已准备", "committed": "已提交",
@@ -3714,6 +3902,17 @@ class BranchSubmitWorkbench:
         ))
         self._matrix_panel_summary = summary
         self.ttk.Label(panel, textvariable=summary, style="Workbench.Summary.TLabel").pack(fill="x", pady=(0, 6))
+        scope_text = "；".join(
+            f"{target}: {len(paths)} 个路径"
+            for target, paths in batch.target_update_scopes.items()
+        ) or "无目标更新（仅源分支原生提交）"
+        scope_var = self.tk.StringVar(value=scope_text)
+        self._matrix_panel_scope = scope_var
+        self.ttk.Label(
+            panel,
+            textvariable=scope_var,
+            style="Workbench.Hint.TLabel",
+        ).pack(fill="x", pady=(0, 6))
         holder = self.ttk.Frame(panel, style="Panel.TFrame")
         holder.pack(fill="both", expand=True)
         tree = self.ttk.Treeview(holder, columns=("branch", "file", "operation", "state", "reason"), show="headings", selectmode="browse", style="Workbench.Treeview", height=5)
@@ -3788,7 +3987,8 @@ class BranchSubmitWorkbench:
         self.preflight_button.state(["disabled"])
         self._refresh_primary_button()
         self.status_var.set(
-            f"正在更新 {len(targets)} 个目标分支的相关路径，随后生成预检查矩阵…"
+            f"预检查将按选中文件逐路径更新 {len(targets)} 个目标分支；"
+            "新增文件只更新父目录，随后重新读取服务器 freshness…"
         )
         self.root.update_idletasks()
 

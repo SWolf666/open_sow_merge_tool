@@ -57,7 +57,7 @@ from .difference_browser import DifferenceBrowser
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-03.update91"
+APP_VERSION = "2026-09-04.update92"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -11149,6 +11149,9 @@ def pick_files_or_conflict():
         return None
 
     return ("diff", a, b)
+
+
+_DEFAULT_PICKER_FUNCTION = pick_files_or_conflict
 
 
 def _atomic_save_wb(wb, target_path: str):
@@ -38143,6 +38146,11 @@ def main():
         parser.add_argument("--theirs")
         parser.add_argument("--merged")
         parser.add_argument("--title")
+        parser.add_argument(
+            "--compare",
+            action="store_true",
+            help="打开 Excel 文件比较/合并启动中心，并将显式路径仅作为预填",
+        )
         parser.add_argument("--textdiff", action="store_true", help="Only generate text files and open TortoiseMerge")
         parser.add_argument(
             "--branch-submit",
@@ -38229,7 +38237,7 @@ def main():
             a, b = args.base, args.mine
         elif args.file_a and args.file_b:
             a, b = args.file_a, args.file_b
-        elif args.file_a and (not args.file_b) and (not args.base) and (not args.mine) and (not args.theirs):
+        elif args.file_a and (not args.file_b) and (not args.base) and (not args.mine) and (not args.theirs) and not args.compare:
             # Single file provided (e.g., from Explorer/TortoiseSVN). If it's a conflicted file, auto-merge it.
             conflict = _detect_svn_conflict_files(args.file_a)
             if (not conflict) and args.file_a:
@@ -38245,33 +38253,41 @@ def main():
             else:
                 a, b = args.file_a, None
         else:
-            # Keep the legacy picker available, but make the new batch flow
-            # discoverable on a normal desktop launch.
-            # Embedders/tests may replace the legacy picker; in that case keep
-            # their injected selection synchronous and do not create a second
-            # startup Tk root just to show the optional mode chooser.
-            picker_is_default = getattr(pick_files_or_conflict, "__module__", __name__) == __name__
-            if picker_is_default and not any((args.file_a, args.file_b, args.base, args.mine, args.theirs, args.merged, args.textdiff)):
-                from sow_merge_tool.branch_submit import prompt_mode
-                if prompt_mode() == "branch":
+            # A normal desktop launch now opens the explicit start centre.  A
+            # Tortoise/Explorer ``--compare`` launch does the same with its
+            # path prefilled; no file is opened or written until the user
+            # confirms the pair.  Keep the injectable legacy picker for test
+            # hosts and embedders that intentionally replace it.
+            picker_is_default = pick_files_or_conflict is _DEFAULT_PICKER_FUNCTION
+            if args.compare or picker_is_default:
+                from .launch_center import launch_start_center
+
+                prefill = [value for value in (args.file_a, args.file_b) if value]
+                result = launch_start_center(prefill)
+                if result.mode == "branch":
                     from sow_merge_tool.branch_submit import launch_ui
-                    launch_ui()
+
+                    launch_ui(result.paths)
                     return
-            sel = pick_files_or_conflict()
-            if not sel:
-                return
-            if sel[0] == "merge":
-                _mode, base_p, mine_p, theirs_p, merged_p, force_ui = sel
-                # Preserve auto-detected/file-picker conflict artifacts as raw
-                # SVN identities.  The shared startup analysis creates stable
-                # copies only after scenario/revision evidence is recorded.
-                args.base = base_p
-                args.mine = mine_p
-                args.theirs = theirs_p
-                args.merged = merged_p
-                args.force_ui = bool(force_ui)
+                if result.mode != "compare" or len(result.paths) != 2:
+                    return
+                a, b = result.paths
             else:
-                _mode, a, b = sel
+                sel = pick_files_or_conflict()
+                if not sel:
+                    return
+                if sel[0] == "merge":
+                    _mode, base_p, mine_p, theirs_p, merged_p, force_ui = sel
+                    # Preserve auto-detected/file-picker conflict artifacts as raw
+                    # SVN identities.  The shared startup analysis creates stable
+                    # copies only after scenario/revision evidence is recorded.
+                    args.base = base_p
+                    args.mine = mine_p
+                    args.theirs = theirs_p
+                    args.merged = merged_p
+                    args.force_ui = bool(force_ui)
+                else:
+                    _mode, a, b = sel
 
         if args.file_a and (args.file_b is None) and (not args.base) and b is None:
             # Need second file for diff mode

@@ -45,8 +45,15 @@ $settings = @(
 )
 $contextPaths = @(
   'HKCU:\Software\Classes\SystemFileAssociations\.xlsx\shell\SowMultiBranchSVNSubmit',
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsm\shell\SowMultiBranchSVNSubmit',
   'HKCU:\Software\Classes\Directory\shell\SowMultiBranchSVNSubmit',
   'HKCU:\Software\Classes\Directory\Background\shell\SowMultiBranchSVNSubmit'
+)
+$compareContextPaths = @(
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsx\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsm\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\Directory\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\Directory\Background\shell\SowExcelCompareMerge'
 )
 
 function Get-RegistryEntry($setting) {
@@ -94,6 +101,18 @@ foreach ($path in $contextPaths) {
   $commandPath = Join-Path $path 'command'
   New-Item -ItemType Directory -Force -Path $commandPath | Out-Null
   Set-Item -LiteralPath $commandPath -Value ($quote + $tool + $quote + ' --branch-submit ' + $quote + $token + $quote)
+}
+$compareLabel = 'Excel 文件比较/合并'
+foreach ($path in $compareContextPaths) {
+  New-Item -ItemType Directory -Force -Path $path | Out-Null
+  Set-Item -LiteralPath $path -Value $compareLabel
+  New-ItemProperty -LiteralPath $path -Name Icon -PropertyType String -Value ($quote + $tool + $quote + ',0') -Force | Out-Null
+  New-ItemProperty -LiteralPath $path -Name Position -PropertyType String -Value Top -Force | Out-Null
+  if ($path -like '*SystemFileAssociations*') { New-ItemProperty -LiteralPath $path -Name MultiSelectModel -PropertyType String -Value Player -Force | Out-Null }
+  $token = if ($path -like '*Background*') { '%V' } else { '%1' }
+  $commandPath = Join-Path $path 'command'
+  New-Item -ItemType Directory -Force -Path $commandPath | Out-Null
+  Set-Item -LiteralPath $commandPath -Value ($quote + $tool + $quote + ' --compare ' + $quote + $token + $quote)
 }
 if ($contextOnly) { Write-Host '右键菜单安装完成。' } else { Write-Host '安装完成，已保存原有 TortoiseSVN 配置。' }
 # POWERSHELL-END

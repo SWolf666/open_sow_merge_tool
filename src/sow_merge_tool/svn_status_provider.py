@@ -64,6 +64,23 @@ class SvnStatusRecord:
     moved_from: str = ""
     moved_to: str = ""
     revision: int | None = None
+    # ``revision`` is the working-copy BASE revision.  The repository fields
+    # are populated only when ``svn status --verbose`` (or the native
+    # TortoiseSVN ABI) can prove a newer server-side node.  Keeping them
+    # optional preserves compatibility with old cached/test records while
+    # allowing the submit engine to enforce per-file freshness when evidence
+    # is available.
+    repository_revision: int | None = None
+    repository_node_status: str = ""
+    repository_text_status: str = ""
+    repository_prop_status: str = ""
+    repository_changed_revision: int | None = None
+    # Friendly aliases used by newer callers; both names are serialized so
+    # cached status adapters can migrate without losing evidence.
+    remote_revision: int | None = None
+    remote_node_status: str = ""
+    remote_text_status: str = ""
+    remote_prop_status: str = ""
     repos_root_url: str = ""
     repos_uuid: str = ""
     repos_relpath: str = ""
@@ -130,6 +147,18 @@ def _parse_cli_status(xml_text: str, requested_path: str) -> list[SvnStatusRecor
         lock = wc.find("lock")
         item = str(wc.get("item") or "none")
         props = str(wc.get("props") or "none")
+        repos = wc.find("repos-status")
+        if repos is None:
+            repos = entry.find("repos-status")
+        commit = wc.find("commit")
+        remote_item = str(repos.get("item") or "") if repos is not None else ""
+        remote_props = str(repos.get("props") or "") if repos is not None else ""
+        remote_revision = None
+        if repos is not None and str(repos.get("revision") or "").isdigit():
+            remote_revision = int(repos.get("revision"))
+        changed_revision = None
+        if commit is not None and str(commit.get("revision") or "").isdigit():
+            changed_revision = int(commit.get("revision"))
         record = SvnStatusRecord(
             path=os.path.abspath(path),
             node_kind="dir" if os.path.isdir(path) else "file",
@@ -146,6 +175,15 @@ def _parse_cli_status(xml_text: str, requested_path: str) -> list[SvnStatusRecor
             moved_from=str(wc.get("moved-from") or ""),
             moved_to=str(wc.get("moved-to") or ""),
             revision=int(wc.get("revision")) if str(wc.get("revision") or "").isdigit() else None,
+            repository_revision=remote_revision,
+            repository_node_status=remote_item,
+            repository_text_status=remote_item,
+            repository_prop_status=remote_props,
+            repository_changed_revision=changed_revision,
+            remote_revision=remote_revision,
+            remote_node_status=remote_item,
+            remote_text_status=remote_item,
+            remote_prop_status=remote_props,
         )
         records.append(record)
     return records
@@ -185,13 +223,26 @@ def _communicate_cancelable(command: list[str], *, timeout: float, cancel_event:
         if stderr_file: stderr_file.close()
 
 
-def _status_via_cli(path: str, cancel_event: threading.Event | None = None) -> list[SvnStatusRecord]:
+def _status_via_cli(
+    path: str,
+    cancel_event: threading.Event | None = None,
+    *,
+    remote: bool = False,
+    show_updates: bool = False,
+) -> list[SvnStatusRecord]:
     svn = _find_svn_cli()
     if not svn:
         raise SvnStatusError("svn-cli-unavailable")
     try:
+        command = [svn, "status", "--xml", "--verbose", "--depth", "infinity", "--ignore-externals"]
+        if remote or show_updates:
+            # ``--show-updates`` is read-only but asks the repository for the
+            # exact selected-path freshness.  It never updates the working
+            # copy; callers decide whether an explicit Update is allowed.
+            command.append("--show-updates")
+        command.append(path)
         returncode, stdout, stderr = _communicate_cancelable(
-            [svn, "status", "--xml", "--verbose", "--depth", "infinity", "--ignore-externals", path],
+            command,
             timeout=120,
             cancel_event=cancel_event,
             capture=True,
@@ -272,7 +323,7 @@ def _native_error(svn, pointer, operation: str) -> None:
         raise SvnStatusError(f"{operation}：{message or 'native SVN error'}")
 
 
-def query_tortoise_status_in_child(path: str) -> list[SvnStatusRecord]:
+def query_tortoise_status_in_child(path: str, *, remote: bool = False) -> list[SvnStatusRecord]:
     """Execute only inside the isolated helper process."""
     bin_dir = _find_tortoise_bin()
     if not bin_dir or not hasattr(os, "add_dll_directory") or not hasattr(ctypes, "WinDLL"):
@@ -323,9 +374,15 @@ def query_tortoise_status_in_child(path: str) -> list[SvnStatusRecord]:
                     return None
                 status = status_ptr.contents
                 node_status = STATUS_NAMES.get(int(status.node_status), f"unknown-{status.node_status}")
-                if node_status in {"normal", "ignored", "external", "none"} and not (
+                remote_node_status = STATUS_NAMES.get(int(status.repos_node_status), "none")
+                remote_text_status = STATUS_NAMES.get(int(status.repos_text_status), "none")
+                remote_prop_status = STATUS_NAMES.get(int(status.repos_prop_status), "none")
+                if node_status in {"normal", "ignored", "external", "none"} and not remote and not (
                     status.conflicted or status.switched or status.file_external
                     or STATUS_NAMES.get(int(status.prop_status)) not in {"none", "normal"}
+                    or remote_node_status not in {"none", "normal"}
+                    or remote_text_status not in {"none", "normal"}
+                    or remote_prop_status not in {"none", "normal"}
                 ):
                     return None
                 raw_path = _decode(status.local_abspath) or _decode(callback_path)
@@ -344,6 +401,21 @@ def query_tortoise_status_in_child(path: str) -> list[SvnStatusRecord]:
                     moved_from=_decode(status.moved_from_abspath),
                     moved_to=_decode(status.moved_to_abspath),
                     revision=int(status.revision) if int(status.revision) >= 0 else None,
+                    repository_revision=(
+                        int(status.ood_changed_rev) if int(status.ood_changed_rev) >= 0 else None
+                    ),
+                    repository_node_status=remote_node_status,
+                    repository_text_status=remote_text_status,
+                    repository_prop_status=remote_prop_status,
+                    repository_changed_revision=(
+                        int(status.ood_changed_rev) if int(status.ood_changed_rev) >= 0 else None
+                    ),
+                    remote_revision=(
+                        int(status.ood_changed_rev) if int(status.ood_changed_rev) >= 0 else None
+                    ),
+                    remote_node_status=remote_node_status,
+                    remote_text_status=remote_text_status,
+                    remote_prop_status=remote_prop_status,
                     repos_root_url=_decode(status.repos_root_url),
                     repos_uuid=_decode(status.repos_uuid),
                     repos_relpath=_decode(status.repos_relpath),
@@ -369,7 +441,13 @@ def query_tortoise_status_in_child(path: str) -> list[SvnStatusRecord]:
         error = svn.svn_client_status6(
             ctypes.byref(result_revision), context, os.path.abspath(path).encode("utf-8"),
             ctypes.byref(revision), 3,  # svn_depth_infinity
-            0, 0, 1, 0, 1, 0, None, callback, None, pool,
+            1 if remote else 0,
+            1 if remote else 0,
+            1,
+            0,
+            1,
+            0,
+            None, callback, None, pool,
         )
         _native_error(svn, error, "TortoiseSVN 状态扫描失败")
         poison = next((item for item in records if item.node_status == "status-callback-failed"), None)
@@ -393,12 +471,13 @@ def query_tortoise_status_in_child(path: str) -> list[SvnStatusRecord]:
 
 
 def internal_status_entrypoint(argv: list[str]) -> int:
-    if len(argv) != 2:
+    if len(argv) not in {2, 3}:
         return 2
     path, output_path = argv
+    remote = len(argv) == 3 and argv[2] in {"--remote", "--show-updates"}
     payload: dict
     try:
-        payload = {"ok": True, "items": [asdict(item) for item in query_tortoise_status_in_child(path)]}
+        payload = {"ok": True, "items": [asdict(item) for item in query_tortoise_status_in_child(path, remote=remote)]}
     except Exception as exc:
         payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     try:
@@ -411,7 +490,13 @@ def internal_status_entrypoint(argv: list[str]) -> int:
     return 0 if payload.get("ok") else 1
 
 
-def _status_via_tortoise_child(path: str, host_script: str | None = None, cancel_event: threading.Event | None = None) -> list[SvnStatusRecord]:
+def _status_via_tortoise_child(
+    path: str,
+    host_script: str | None = None,
+    cancel_event: threading.Event | None = None,
+    *,
+    remote: bool = False,
+) -> list[SvnStatusRecord]:
     if not _find_tortoise_bin():
         raise SvnStatusError("未找到 svn.exe 或 TortoiseSVN 状态运行库")
     result_path = os.path.join(tempfile.gettempdir(), f"sow_svn_status_{os.getpid()}_{uuid.uuid4().hex}.json")
@@ -422,6 +507,8 @@ def _status_via_tortoise_child(path: str, host_script: str | None = None, cancel
         # an editable checkout and an installed package.
         command.extend(("-m", "sow_merge_tool"))
     command.extend(("--internal-svn-status-query", os.path.abspath(path), result_path))
+    if remote:
+        command.append("--remote")
     try:
         returncode, _stdout, _stderr = _communicate_cancelable(
             command,
@@ -444,7 +531,14 @@ def _status_via_tortoise_child(path: str, host_script: str | None = None, cancel
             pass
 
 
-def scan_status(path: str, *, host_script: str | None = None, cancel_event: threading.Event | None = None) -> list[SvnStatusRecord]:
+def scan_status(
+    path: str,
+    *,
+    host_script: str | None = None,
+    cancel_event: threading.Event | None = None,
+    remote: bool = False,
+    show_updates: bool = False,
+) -> list[SvnStatusRecord]:
     """Return interesting recursive WC statuses, or raise instead of guessing."""
     absolute = os.path.abspath(path)
     if not os.path.exists(absolute):
@@ -460,8 +554,18 @@ def scan_status(path: str, *, host_script: str | None = None, cancel_event: thre
     if not absolute or not os.path.exists(absolute):
         raise SvnStatusError(f"状态扫描路径不存在：{path}")
     if _find_svn_cli():
-        return _status_via_cli(absolute, cancel_event=cancel_event)
-    return _status_via_tortoise_child(absolute, host_script=host_script, cancel_event=cancel_event)
+        return _status_via_cli(
+            absolute,
+            cancel_event=cancel_event,
+            remote=remote,
+            show_updates=show_updates,
+        )
+    return _status_via_tortoise_child(
+        absolute,
+        host_script=host_script,
+        cancel_event=cancel_event,
+        remote=remote or show_updates,
+    )
 
 
 def records_by_path(records: Iterable[SvnStatusRecord]) -> dict[str, SvnStatusRecord]:

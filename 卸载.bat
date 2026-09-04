@@ -20,10 +20,18 @@ $contextOnly = $argsText -contains '/context-only'
 $statePath = Join-Path (Join-Path $env:LOCALAPPDATA 'SowMergeTool') 'install-state.json'
 $contextPaths = @(
   'HKCU:\Software\Classes\SystemFileAssociations\.xlsx\shell\SowMultiBranchSVNSubmit',
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsm\shell\SowMultiBranchSVNSubmit',
   'HKCU:\Software\Classes\Directory\shell\SowMultiBranchSVNSubmit',
   'HKCU:\Software\Classes\Directory\Background\shell\SowMultiBranchSVNSubmit'
 )
+$compareContextPaths = @(
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsx\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\SystemFileAssociations\.xlsm\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\Directory\shell\SowExcelCompareMerge',
+  'HKCU:\Software\Classes\Directory\Background\shell\SowExcelCompareMerge'
+)
 foreach ($path in $contextPaths) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
+foreach ($path in $compareContextPaths) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
 if ($contextOnly) { Write-Host '右键菜单卸载完成。'; exit 0 }
 if (-not (Test-Path -LiteralPath $statePath)) { Write-Host '未找到安装状态，只完成了右键菜单卸载。'; exit 0 }
 

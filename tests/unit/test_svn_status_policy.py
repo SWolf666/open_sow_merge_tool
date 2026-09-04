@@ -207,3 +207,86 @@ def test_move_metadata_is_blocked_before_preflight(tmp_path):
     engine = bs.BranchSubmitEngine(os.fspath(tmp_path), allowed_branches=("develop", "release"))
     with pytest.raises(RuntimeError, match="Repair Move"):
         engine._source_snapshot(batch, item)
+
+
+def test_remote_status_xml_exposes_repository_revision() -> None:
+    xml = """
+    <status>
+      <target path="C:/wc">
+        <entry path="A.xlsx">
+          <wc-status item="modified" props="none" revision="12">
+            <commit revision="12" />
+          </wc-status>
+          <repos-status item="modified" props="none" revision="15" />
+        </entry>
+      </target>
+    </status>
+    """
+    records = sp._parse_cli_status(xml, r"C:\wc")
+    assert len(records) == 1
+    assert records[0].revision == 12
+    assert records[0].repository_revision == 15
+    assert records[0].repository_node_status == "modified"
+
+
+def test_source_remote_staleness_is_a_hard_gate_without_update(tmp_path, monkeypatch):
+    root = tmp_path / "wc"
+    source = root / "develop" / "A.xlsx"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    monkeypatch.setattr(bs, "settings_dir", lambda: str(tmp_path / "state"))
+    plan = bs.FilePlan(relative_path="A.xlsx", source_revision=12)
+    batch = bs.BranchSubmitBatch(
+        batch_id="freshness-source",
+        wc_root=str(root),
+        source_branch="develop",
+        target_branches=["release"],
+        files=[plan],
+        message="",
+    )
+    record = sp.SvnStatusRecord(
+        path=str(source), node_kind="file", node_status="modified", versioned=True,
+        revision=12, repository_revision=15,
+    )
+    engine = bs.BranchSubmitEngine(str(root), require_remote_freshness=True)
+    with pytest.raises(RuntimeError, match="不会自动更新源分支"):
+        engine._check_source_freshness(batch, {os.path.normcase(os.path.abspath(source)): record})
+    assert any(item["kind"] == "source-freshness" for item in batch.journal)
+
+
+def test_target_remote_staleness_after_update_fails_closed(tmp_path, monkeypatch):
+    root = tmp_path / "wc"
+    target = root / "release" / "A.xlsx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"target")
+    monkeypatch.setattr(bs, "settings_dir", lambda: str(tmp_path / "state"))
+    plan = bs.FilePlan(relative_path="A.xlsx")
+    batch = bs.BranchSubmitBatch(
+        batch_id="freshness-target",
+        wc_root=str(root),
+        source_branch="develop",
+        target_branches=["release"],
+        files=[plan],
+        message="",
+    )
+    record = sp.SvnStatusRecord(
+        path=str(target), node_kind="file", node_status="normal", versioned=True,
+        revision=12, repository_revision=13,
+    )
+    engine = bs.BranchSubmitEngine(str(root), require_remote_freshness=True)
+    with pytest.raises(RuntimeError, match="更新后仍无法确认"):
+        engine._check_target_freshness(
+            batch, "release", {os.path.normcase(os.path.abspath(target)): record}, phase="after-update"
+        )
+
+
+def test_status_snapshot_requests_remote_without_breaking_legacy_scanner(tmp_path):
+    calls = []
+
+    def scanner(path, **kwargs):
+        calls.append(kwargs)
+        return []
+
+    engine = bs.BranchSubmitEngine(str(tmp_path), status_scanner=scanner)
+    assert engine._status_snapshot(str(tmp_path), remote=True) == []
+    assert calls == [{"remote": True}]

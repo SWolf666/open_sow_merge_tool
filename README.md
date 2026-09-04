@@ -17,4 +17,6 @@ Windows Excel 合并与多分支 SVN 提交工具，最终交付物为
 .\tools\release.ps1 -DeployPath 'C:\sow_main\excel\excel_merge_tool'
 ```
 
+Fast/Integration/Adversarial/Full 默认不打开可视窗口；需要 Tk/Win32 截图和 DPI 抽检时显式运行 `.\tools\test.ps1 -Profile Native` 或 `.\tools\test.ps1 -Profile Visual`。
+
 Feishu 需求文档和真实业务配置在验证期间保持只读。

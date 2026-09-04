@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from openpyxl import Workbook
+
 from sow_merge_tool.launch_center import (
     COMPARISON_STATES,
     ComparisonLaunch,
+    ComparisonListModel,
     ComparisonSessionManager,
 )
 from sow_merge_tool.legacy_core import RolePresentation
+from sow_merge_tool.path_selection import PairStatus, RelativeMapping
 
 
 class _FakeProcess:
@@ -78,3 +82,32 @@ def test_source_target_presentation_keeps_source_read_only_target_writable():
     presentation = RolePresentation.for_app(app)
     assert (presentation.left, presentation.right) == ("Source", "Target")
     assert presentation.action_label("A2B") == "应用 Source → Target 行"
+
+
+def test_headless_list_model_covers_open_double_click_and_parent_close(tmp_path):
+    left = tmp_path / "Source.xlsx"
+    right = tmp_path / "Target.xlsx"
+    for path, value in ((left, "left"), (right, "right")):
+        workbook = Workbook()
+        workbook.active["A1"] = value
+        workbook.save(path)
+        workbook.close()
+    process = _FakeProcess()
+    manager = ComparisonSessionManager(popen_factory=lambda _command, **_kwargs: process)
+    mapping = RelativeMapping("Data.xlsx", str(left), str(right), PairStatus.MATCHED)
+    model = ComparisonListModel((mapping,), manager=manager)
+    session = model.double_click("mapping-0")
+    assert session.state == "比较中"
+    assert model.row_state("mapping-0") == "比较中"
+    assert "--compare" not in session.launch.command
+    try:
+        model.double_click("mapping-0")
+    except RuntimeError as exc:
+        assert "已有" in str(exc)
+    else:
+        raise AssertionError("headless list must reject a second active child")
+    model.close()
+    assert not process.terminated
+    process.returncode = 0
+    model.manager.poll_now()
+    assert model.row_state("mapping-0") == "已关闭"

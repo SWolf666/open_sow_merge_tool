@@ -225,6 +225,99 @@ class ComparisonSessionManager:
             except (AttributeError, OSError):
                 pass
 
+
+@dataclass
+class ComparisonRow:
+    row_id: str
+    mapping: RelativeMapping
+    state: str = "未打开"
+    session_id: str = ""
+
+
+class ComparisonListModel:
+    """Headless pairing-list controller shared by tests and the Tk adapter."""
+
+    def __init__(
+        self,
+        mappings: Iterable[RelativeMapping] = (),
+        *,
+        manager: ComparisonSessionManager | None = None,
+        validator: Callable[[str], None] | None = None,
+    ):
+        self.manager = manager or ComparisonSessionManager()
+        self.validator = validator or validate_excel_package
+        self.rows: dict[str, ComparisonRow] = {}
+        self.closed = False
+        self.set_mappings(mappings)
+
+    def set_mappings(self, mappings: Iterable[RelativeMapping]) -> None:
+        self.rows = {
+            f"mapping-{index}": ComparisonRow(f"mapping-{index}", mapping)
+            for index, mapping in enumerate(mappings)
+        }
+
+    refresh = set_mappings
+
+    def _row_for_session(self, session: ComparisonSession) -> ComparisonRow | None:
+        for row in self.rows.values():
+            if row.session_id == session.session_id or (
+                row.mapping.left_path == session.launch.left_path
+                and row.mapping.right_path == session.launch.right_path
+            ):
+                return row
+        return None
+
+    def _on_session(self, session: ComparisonSession, callback) -> None:
+        row = self._row_for_session(session)
+        if row is not None:
+            row.session_id = session.session_id
+            row.state = session.state
+        if callback is not None:
+            callback(session)
+
+    def open_row(
+        self,
+        row_id: str,
+        *,
+        callback: Callable[[ComparisonSession], None] | None = None,
+    ) -> ComparisonSession:
+        if self.closed:
+            raise RuntimeError("配对列表已关闭，请重新打开列表")
+        row = self.rows.get(row_id)
+        if row is None:
+            raise KeyError(row_id)
+        if not row.mapping.complete or not row.mapping.left_path or not row.mapping.right_path:
+            raise PathSelectionError("该配对缺少一侧明确文件")
+        if self.manager.active_session is not None:
+            raise RuntimeError("已有一个比较窗口正在运行")
+        snapshot = snapshot_selection(row.mapping.left_path, row.mapping.right_path)
+        current = recheck_selection(snapshot)
+        self.validator(current.left.path)
+        self.validator(current.right.path)
+        session = self.manager.start(
+            current.left.path,
+            current.right.path,
+            callback=lambda value: self._on_session(value, callback),
+        )
+        if session is None:
+            raise RuntimeError("已有一个比较窗口正在运行")
+        row.session_id = session.session_id
+        row.state = session.state
+        return session
+
+    double_click = open_row
+
+    def close(self) -> None:
+        self.closed = True
+        self.manager.close(terminate=False)
+
+    def reopen(self) -> None:
+        self.closed = False
+        self.manager.resume()
+
+    def row_state(self, row_id: str) -> str:
+        return self.rows[row_id].state
+
     def resume(self, root=None) -> None:
         """Resume polling an existing child when the pairing list is reopened."""
         if root is not None:
@@ -876,6 +969,8 @@ __all__ = [
     "COMPARISON_STATES",
     "CompareSelectionDialog",
     "ComparisonLaunch",
+    "ComparisonListModel",
+    "ComparisonRow",
     "ComparisonSession",
     "ComparisonSessionManager",
     "StartCenter",

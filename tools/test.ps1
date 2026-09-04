@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('Fast', 'Full', 'Integration', 'Native', 'Adversarial')]
+  [ValidateSet('Fast', 'Full', 'Integration', 'Native', 'Visual', 'Adversarial')]
   [string]$Profile = 'Fast',
   [int]$TimeoutSeconds = 120
 )
@@ -36,6 +36,25 @@ $env:LOCALAPPDATA = $testAppData
 $env:SOW_TEST_TMPDIR = $testRoot
 $env:PYTHONUTF8 = '1'
 $env:SOW_SKIP_REAL_WC_TESTS = if ($Profile -eq 'Native') { '0' } else { '1' }
+$initialMergePids = @(
+  Get-Process -Name 'sow_merge_tool' -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Id
+)
+if ($Profile -in @('Native', 'Visual') -and $initialMergePids.Count -gt 0) {
+  throw "Native/Visual 测试前发现已有 sow_merge_tool.exe 实例，请先关闭后再运行；工具不会强杀业务实例。"
+}
+
+function Assert-NoUnexpectedMergeProcess {
+  if ($Profile -notin @('Fast', 'Full', 'Integration', 'Adversarial')) { return }
+  $current = @(
+    Get-Process -Name 'sow_merge_tool' -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty Id
+  )
+  $unexpected = @($current | Where-Object { $_ -notin $initialMergePids })
+  if ($unexpected.Count -gt 0) {
+    throw "无界面 profile 意外启动了 sow_merge_tool.exe 实例：$($unexpected -join ', ')"
+  }
+}
 
 function Invoke-PythonFile {
   param([string]$Path)
@@ -82,10 +101,32 @@ $fastSmokeNames = @(
   '_smoke_test_svn_conflict_detection.py',
   '_smoke_test_svn_merge_role_semantics.py'
 )
+$visualSmokeNames = @(
+  '_smoke_test_2way_formula_cache_save.py',
+  '_smoke_test_2way_row_replay.py',
+  '_smoke_test_3way_alignment.py',
+  '_smoke_test_3way_only_diff_base_insert.py',
+  '_smoke_test_3way_pristine_base_tail_block.py',
+  '_smoke_test_3way_tail_append_split.py',
+  '_smoke_test_blank_shared_formula_b_save.py',
+  '_smoke_test_cursor_block.py',
+  '_smoke_test_difference_browser_real_workbooks.py',
+  '_smoke_test_excel_com_blank_cell.py',
+  '_smoke_test_formula_cache_undo.py',
+  '_smoke_test_large_3way_merge_open.py',
+  '_smoke_test_large_3way_only_diff.py',
+  '_smoke_test_large_only_diff_row_insert.py',
+  '_smoke_test_manual_merge_row_insert.py',
+  '_smoke_test_only_diff_minimap.py',
+  '_smoke_test_recovery_progress_close.py',
+  '_smoke_test_sheet_level_ops.py',
+  '_smoke_test_xlsm_support.py',
+  '_smoke_test.py'
+)
 $selectedSmoke = if ($Profile -eq 'Full') {
-  $allSmoke
+  @($allSmoke | Where-Object { $_.Name -notin $visualSmokeNames })
 } elseif ($Profile -eq 'Fast') {
-  @($allSmoke | Where-Object { $_.Name -in $fastSmokeNames })
+  @($allSmoke | Where-Object { $_.Name -in $fastSmokeNames -and $_.Name -notin $visualSmokeNames })
 } elseif ($Profile -eq 'Adversarial') {
   @($allSmoke | Where-Object { $_.Name -in @(
     '_smoke_test_branch_submit.py',
@@ -101,7 +142,10 @@ if ($Profile -eq 'Fast') {
     throw "Fast smoke manifest contains missing files: $($missingFastSmoke -join ', ')"
   }
 }
-foreach ($test in $selectedSmoke) { Invoke-PythonFile $test.FullName }
+foreach ($test in $selectedSmoke) {
+  Invoke-PythonFile $test.FullName
+  Assert-NoUnexpectedMergeProcess
+}
 
 if ($Profile -in @('Fast', 'Full', 'Adversarial')) {
   $pytest = Join-Path $repo '.venv\Scripts\pytest.exe'
@@ -132,6 +176,30 @@ if ($Profile -eq 'Native') {
   if ($LASTEXITCODE -ne 0) { throw "Native start-centre GUI test failed with exit code $LASTEXITCODE" }
   & $python (Join-Path $testScriptRoot '_gui_self_test_comparison_sessions.py')
   if ($LASTEXITCODE -ne 0) { throw "Native comparison-session GUI test failed with exit code $LASTEXITCODE" }
+}
+
+if ($Profile -eq 'Visual') {
+  Write-Warning 'Visual profile 会打开真实 Tk/Win32 窗口；仅使用临时验收数据，不要与业务实例同时运行。'
+  $visualFiles = @(
+    '_gui_self_test_branch_submit_workbench.py',
+    '_gui_self_test_merge_file_paths.py',
+    '_gui_self_test_start_center.py',
+    '_gui_self_test_comparison_sessions.py',
+    '_gui_self_test_logical_column_actions.py'
+  )
+  foreach ($name in $visualFiles) {
+    $path = Join-Path $testScriptRoot $name
+    if (-not (Test-Path -LiteralPath $path)) { throw "Visual manifest contains missing file: $name" }
+    Invoke-PythonFile $path
+  }
+}
+
+Assert-NoUnexpectedMergeProcess
+if ($Profile -in @('Native', 'Visual')) {
+  $remaining = @(Get-Process -Name 'sow_merge_tool' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+  if ($remaining.Count -gt 0) {
+    Write-Warning "Native/Visual 测试结束仍有 sow_merge_tool.exe 实例：$($remaining -join ', ')；未强杀，请人工确认。"
+  }
 }
 
 Write-Host "Test profile $Profile passed." -ForegroundColor Green

@@ -57,7 +57,7 @@ from .difference_browser import DifferenceBrowser
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-04.update93"
+APP_VERSION = "2026-09-04.update94"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 

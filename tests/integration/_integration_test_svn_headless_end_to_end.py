@@ -44,6 +44,7 @@ os.environ["PATH"] = os.fspath(SVN_BIN) + os.pathsep + os.environ.get("PATH", ""
 bs = importlib.import_module("sow_merge_tool.branch_submit")
 sp = importlib.import_module("sow_merge_tool.svn_status_provider")
 sl = importlib.import_module("sow_merge_tool.svn_log_provider")
+rp = importlib.import_module("sow_merge_tool.risk_policy")
 
 
 SVN = SVN_BIN / "svn.exe"
@@ -546,6 +547,46 @@ def run_tortoise_runtime_structured_log(root: Path) -> None:
     assert entries[0].author == "tester"
 
 
+def run_real_repository_risk_log(root: Path) -> None:
+    """Verify a branch-local delete/common add is only an advisory risk."""
+    _repository, url = _create_repository(root)
+    wc = root / "risk-wc"
+    _checkout(f"{url}/sheets", wc)
+    local_old = wc / "develop" / "language" / "Old.xlsx"
+    common_existing = wc / "common" / "ErrorCode.xlsx"
+    _book(local_old, 1, extra="branch-local")
+    _book(common_existing, 1, extra="common")
+    _run(SVN, "add", local_old.parent)
+    _run(SVN, "add", common_existing.parent)
+    _run(SVN, "commit", local_old.parent, common_existing.parent, "-m", "normal merge", "--username", "tester", "--non-interactive")
+
+    common_new = wc / "common" / "ErrorCodeV2.xlsx"
+    _book(common_new, 2, extra="common")
+    _run(SVN, "delete", local_old)
+    _run(SVN, "add", common_new)
+    _run(
+        SVN,
+        "commit",
+        local_old,
+        common_new,
+        "-m",
+        "release merge master full-replacement rollback temp-config",
+        "--username",
+        "tester",
+        "--non-interactive",
+    )
+    entries = sl.read_svn_log(f"{url}/sheets", limit=5)
+    badges = rp.risk_badges(rp.assess_repository_log_risks(entries))
+    assert "分支到公共迁移风险" in badges
+    assert "日志含回滚提示" in badges
+    assert "日志含全量替换提示" in badges
+    assert "日志含临时配置提示" in badges
+    # Audit classification must not perform a path migration or delete any
+    # target content.  The local WC remains exactly as SVN committed it.
+    assert not local_old.exists()
+    assert common_new.exists()
+
+
 def main() -> None:
     test_root = Path(os.environ.get("SOW_TEST_TMPDIR") or tempfile.gettempdir())
     test_root.mkdir(parents=True, exist_ok=True)
@@ -567,6 +608,9 @@ def main() -> None:
     with _temporary_test_dir(test_root) as root:
         run_tortoise_runtime_structured_log(root / "tortoise-log")
         print("PASS TortoiseSVN runtime structured log fallback")
+    with _temporary_test_dir(test_root) as root:
+        run_real_repository_risk_log(root / "risk-log")
+        print("PASS real SVN risk-only migration badges")
     print(f"headless SVN end-to-end tests passed with {SVN.name} { _run(SVN, '--version', '--quiet').stdout.strip() }")
 
 

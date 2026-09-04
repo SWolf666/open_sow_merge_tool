@@ -32,6 +32,7 @@ from typing import ClassVar
 from .fast_branch_merge import analyze_source as fast_analyze_source
 from .fast_branch_merge import analyze_target as fast_analyze_target
 from .fast_branch_merge import apply_source_change_plan
+from .risk_policy import assess_path_risks, assess_repository_log_risks, risk_badges
 from .svn_log_provider import SvnLogError, read_svn_log
 from .svn_status_provider import (
     SvnStatusRecord,
@@ -72,6 +73,12 @@ def _multi_branch_policy_text(node_status: str, reason: str = "") -> str:
         "deleted": "同步删除到目标",
         "missing": "仅源分支；目标不变",
     }.get(node_status, "不进入批次")
+
+
+def _action_reason_text(plan: FilePlan, action: BatchFileAction) -> str:
+    badges = list(dict.fromkeys(action.risk_badges or plan.risk_badges))
+    prefix = f"风险徽章：{'、'.join(badges)}；" if badges else ""
+    return prefix + (action.reason or "保留目标分支其他内容")
 
 
 def _sha256(path: str) -> str:
@@ -197,6 +204,7 @@ class BranchCandidate:
     reason: str = ""
     favorite: bool = False
     last_changed_at: float = 0.0
+    risk_badges: list[str] = field(default_factory=list)
 
 
 def _load_workbook(*args, **kwargs):
@@ -256,6 +264,7 @@ def discover_branch_candidates(wc_root: str, *, favorites: Iterable[str] = ()) -
             repo_root=node.repo_root, repo_uuid=node.repo_uuid,
             favorite=entry.name in favorite_set,
             last_changed_at=changed_times.get(entry.name, entry.stat(follow_symlinks=False).st_mtime),
+            risk_badges=risk_badges(assess_path_risks(entry.name)),
         ))
     candidates.sort(key=lambda item: (-item.last_changed_at, item.name.lower()))
     return candidates
@@ -554,6 +563,7 @@ class BatchFileAction:
     target_base_revision: int | None = None
     target_remote_revision: int | None = None
     update_scope: str = ""
+    risk_badges: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -573,6 +583,8 @@ class FilePlan:
     actions: dict[str, BatchFileAction] = field(default_factory=dict)
     target_summaries: dict[str, dict] = field(default_factory=dict)
     target_details: dict[str, list[dict]] = field(default_factory=dict)
+    risk_badges: list[str] = field(default_factory=list)
+    risk_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1241,6 +1253,13 @@ class BranchSubmitEngine:
         else:
             raise RuntimeError(f"{relative}：不支持的源状态 {item.node_status}")
         plan = FilePlan(relative_path=relative, operation=operation, source_revision=item.revision)
+        path_risks = assess_path_risks(
+            relative,
+            operation=operation,
+            source_branch=batch.source_branch,
+        )
+        plan.risk_badges = risk_badges(path_risks)
+        plan.risk_reasons = [risk.reason for risk in path_risks]
         if operation in {"modify", "delete", SOURCE_ONLY_MISSING}:
             before = core._try_export_svn_base_from_working_copy(source_path)
             if not before:
@@ -1284,7 +1303,12 @@ class BranchSubmitEngine:
         core = self._load_core()
         target_path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
         record = _status_for_exact_path(batch.wc_root, target_path, status_map)
-        action = BatchFileAction(branch=target, relative_path=plan.relative_path, operation=plan.operation)
+        action = BatchFileAction(
+            branch=target,
+            relative_path=plan.relative_path,
+            operation=plan.operation,
+            risk_badges=list(plan.risk_badges),
+        )
         if plan.operation == SOURCE_ONLY_MISSING:
             action.state = "excluded"
             action.disposition = "source_only"
@@ -1549,6 +1573,8 @@ class BranchSubmitEngine:
             "reason": "",
             "entries": [],
             "revisions": [],
+            "risk_badges": [],
+            "risk_reasons": [],
         }
         try:
             try:
@@ -1559,6 +1585,7 @@ class BranchSubmitEngine:
                 entries = self.log_provider(path)
             if entries is None:
                 raise RuntimeError("日志 provider 未返回结果")
+            log_risks = assess_repository_log_risks(entries)
             serialized = [self._structured_log_payload(entry) for entry in entries]
             revisions = sorted({
                 int(item["revision"])
@@ -1567,6 +1594,8 @@ class BranchSubmitEngine:
             }, reverse=True)
             evidence["entries"] = serialized
             evidence["revisions"] = revisions
+            evidence["risk_badges"] = risk_badges(log_risks)
+            evidence["risk_reasons"] = [risk.reason for risk in log_risks]
             evidence["state"] = "available" if serialized else "empty"
             if not serialized:
                 evidence["reason"] = "仓库返回空日志"
@@ -2718,7 +2747,10 @@ class BranchSubmitWorkbench:
             changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(candidate.last_changed_at)) if candidate.last_changed_at else "—"
             state = self._target_status_map.get(candidate.name, "待检查")
             tag = {"可直接同步": "ready", "需人工确认": "confirmation", "安全阻断": "blocked", "已提交": "committed"}.get(state, "")
-            self.target_tree.insert("", "end", iid=iid, values=("☑" if var.get() else "☐", "★" if candidate.favorite else "☆", candidate.name, state, changed), tags=(tag,))
+            branch_label = candidate.name
+            if candidate.risk_badges:
+                branch_label += f" 〔{'、'.join(candidate.risk_badges)}〕"
+            self.target_tree.insert("", "end", iid=iid, values=("☑" if var.get() else "☐", "★" if candidate.favorite else "☆", branch_label, state, changed), tags=(tag,))
 
     def _target_tree_click(self, event):
         if self._ui_busy():
@@ -3991,7 +4023,7 @@ class BranchSubmitWorkbench:
                 tree.delete(iid)
             row_map.clear()
             for index, (plan, target) in enumerate(
-                (pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches))
+                pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches)
             ):
                 action = plan.actions[target]
                 iid = f"panel-matrix-{index}"
@@ -4006,7 +4038,7 @@ class BranchSubmitWorkbench:
                         plan.relative_path,
                         operation_labels.get(plan.operation, plan.operation),
                         state_labels.get(action.state, action.state),
-                        action.reason or "保留目标分支其他内容",
+                        _action_reason_text(plan, action),
                     ),
                 )
                 if selected_key == key:
@@ -4056,10 +4088,10 @@ class BranchSubmitWorkbench:
         self._matrix_panel_operation_labels = operation_labels
         row_map = {}
         self._matrix_panel_row_map = row_map
-        for index, (plan, target) in enumerate((pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches))):
+        for index, (plan, target) in enumerate(pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches)):
             action = plan.actions[target]
             iid = f"panel-matrix-{index}"; row_map[iid] = (target, plan)
-            tree.insert("", "end", iid=iid, values=(target, plan.relative_path, operation_labels.get(plan.operation, plan.operation), state_labels.get(action.state, action.state), action.reason or "保留目标分支其他内容"))
+            tree.insert("", "end", iid=iid, values=(target, plan.relative_path, operation_labels.get(plan.operation, plan.operation), state_labels.get(action.state, action.state), _action_reason_text(plan, action)))
         scroll = self.ttk.Scrollbar(holder, orient="vertical", command=tree.yview); tree.configure(yscrollcommand=scroll.set)
         tree.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
         self._matrix_panel_tree = tree
@@ -4082,7 +4114,7 @@ class BranchSubmitWorkbench:
             entry = selected()
             if entry:
                 target, plan = entry; action = plan.actions[target]
-                detail.set(f"{target} / {plan.relative_path} · {state_labels.get(action.state, action.state)}：{action.reason or '无补充说明'}")
+                detail.set(f"{target} / {plan.relative_path} · {state_labels.get(action.state, action.state)}：{_action_reason_text(plan, action)}")
         tree.bind("<<TreeviewSelect>>", show_detail)
         self.ttk.Button(footer, text="查看目标修改点", command=show_preview).pack(side="right", padx=(6, 0))
         if self._confirmation_entries():

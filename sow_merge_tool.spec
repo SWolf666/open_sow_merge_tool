@@ -15,6 +15,7 @@ a = Analysis(
         "sow_merge_tool.branch_submit",
         "sow_merge_tool.svn_log_provider",
         "sow_merge_tool.svn_status_provider",
+        "sow_merge_tool.risk_policy",
         "sow_merge_tool.ui_foundation",
         "sow_merge_tool.path_selection",
         "sow_merge_tool.launch_center",

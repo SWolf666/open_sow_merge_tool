@@ -854,10 +854,13 @@ def launch_start_center(
     initial_paths: Iterable[str] = (),
     *,
     run_mainloop: bool = True,
+    open_compare: bool = False,
 ) -> StartCenterResult:
     """Run the no-argument/prefilled centre until the user closes it."""
     result: dict = {}
     center = StartCenter(initial_paths=initial_paths, result=result)
+    if open_compare:
+        center._compare()
     if run_mainloop:
         center.root.mainloop()
     return result.get("value", StartCenterResult(None))

@@ -44,7 +44,7 @@ def test_compare_switch_prefills_branch_without_automatic_scan(monkeypatch, tmp_
     monkeypatch.setattr(
         center,
         "launch_start_center",
-        lambda paths: StartCenterResult("branch", tuple(paths)),
+        lambda paths, **_kwargs: StartCenterResult("branch", tuple(paths)),
     )
     from sow_merge_tool import branch_submit
 

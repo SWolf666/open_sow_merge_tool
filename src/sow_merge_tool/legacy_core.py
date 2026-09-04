@@ -38280,7 +38280,11 @@ def main():
                 from .launch_center import launch_start_center
 
                 prefill = [value for value in (args.file_a, args.file_b) if value]
-                result = launch_start_center(prefill)
+                result = (
+                    launch_start_center(prefill, open_compare=True)
+                    if args.compare
+                    else launch_start_center(prefill)
+                )
                 if result.mode == "branch":
                     from sow_merge_tool.branch_submit import launch_ui
 

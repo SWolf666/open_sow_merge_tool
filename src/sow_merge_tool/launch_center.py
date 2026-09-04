@@ -299,6 +299,8 @@ class CompareSelectionDialog:
         self.win.transient(parent)
         self._build()
         self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.win.deiconify()
+        self.win.lift()
         if values:
             self._validate()
 

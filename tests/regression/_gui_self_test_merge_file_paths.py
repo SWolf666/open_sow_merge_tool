@@ -231,6 +231,10 @@ def main() -> None:
         try:
             view = _wait_for_view(app)
             app.root.update_idletasks()
+            assert app.sheet_filter_diff_button.winfo_ismapped()
+            assert app.sheet_filter_all_button.winfo_ismapped()
+            assert app.sheet_filter_summary_var.get().startswith("有差异")
+            assert app._sheet_filter_model.only_diff is True
             assert os.path.normpath(base_path) in view.path_file_label_a.cget("text")
             assert os.path.normpath(mine_path) in view.path_file_label_b.cget("text")
             assert not view.path_card_base.winfo_manager(), "two-way mode must not reserve a blank Base card"

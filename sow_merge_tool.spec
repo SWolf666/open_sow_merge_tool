@@ -19,6 +19,7 @@ a = Analysis(
         "sow_merge_tool.ui_foundation",
         "sow_merge_tool.path_selection",
         "sow_merge_tool.launch_center",
+        "sow_merge_tool.sheet_filter",
     ],
     hookspath=[],
     hooksconfig={},

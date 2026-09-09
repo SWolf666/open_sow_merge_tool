@@ -57,7 +57,7 @@ from .difference_browser import DifferenceBrowser
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-04.update94"
+APP_VERSION = "2026-09-04.update95"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -30570,6 +30570,9 @@ class SowMergeApp:
         self._startup_trace = UiTrace()
         self._startup_trace.mark("app-init")
         self._is_closing = False
+        self._sheet_filter_model = None
+        self._sheet_filter_programmatic_select = False
+        self._sheet_filter_initializing = True
         self._background_threads_lock = threading.Lock()
         self._background_threads: set[threading.Thread] = set()
         self._interactive_action_lock = threading.Lock()
@@ -30798,6 +30801,7 @@ class SowMergeApp:
         self.difference_items: tuple[DifferenceItem, ...] = ()
         self._difference_processed: set[str] = set()
         self.sheet_diff_counts: dict[str, int] = {}
+        self.sheet_diff_total_counts: dict[str, int] = {}
         self._diff_browser = None
 
         self.root = _take_startup_progress_root()
@@ -30945,7 +30949,7 @@ class SowMergeApp:
         except Exception:
             return []
 
-    def _refresh_sheet_catalog(self):
+    def _refresh_sheet_catalog(self, *, reset_filter: bool = False):
         names_a = self._sheet_names_for_side("A")
         names_b = self._sheet_names_for_side("B")
         names_base = self._sheet_names_for_side("BASE")
@@ -30985,6 +30989,14 @@ class SowMergeApp:
         previous_confirmed = set(getattr(self, "_sheet_diff_confirmed", set()) or set())
         self._sheet_diff_confirmed = {s for s in previous_confirmed if s in self.sheet_diff_state}
         self._recompute_auto_sheet_ops()
+        if self._sheet_filter_model is None:
+            from .sheet_filter import SheetFilterModel
+
+            self._sheet_filter_model = SheetFilterModel(self.display_sheets)
+        elif reset_filter:
+            self._sheet_filter_model.reset(self.display_sheets)
+        else:
+            self._sheet_filter_model.sync_names(self.display_sheets)
 
     def _recompute_auto_sheet_ops(self):
         self.auto_sheet_ops = []
@@ -33314,9 +33326,15 @@ class SowMergeApp:
                 items.extend(self._difference_items_from_cache(cache))
         self.difference_items = tuple({item.id: item for item in items}.values())
         counts: dict[str, int] = {}
+        total_counts: dict[str, int] = {}
         for item in self.difference_items:
+            total_counts[item.sheet] = total_counts.get(item.sheet, 0) + 1
             counts[item.sheet] = counts.get(item.sheet, 0) + (0 if item.processed else 1)
         self.sheet_diff_counts = counts
+        self.sheet_diff_total_counts = total_counts
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is not None:
+            model.update_counts_from_items(self.difference_items)
         self._diff_browser.set_items(items)
         self.refresh_sheet_nav()
         self._refresh_command_widgets()
@@ -33557,6 +33575,71 @@ class SowMergeApp:
             return
         self._navigate_to_conflict_cell(item.sheet, int(item.row), int(item.column or 1))
 
+    def _sheet_filter_status(self, sheet: str):
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is None:
+            return None
+        try:
+            return model.status(sheet)
+        except (KeyError, TypeError):
+            return None
+
+    def mark_sheet_loading(self, sheet: str) -> None:
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is None:
+            return
+        model.mark_loading(sheet)
+        self.refresh_sheet_nav()
+
+    def mark_sheet_failed(self, sheet: str, error: str = "") -> None:
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is None:
+            return
+        model.mark_failed(sheet, error)
+        self.refresh_sheet_nav()
+
+    def _select_sheet_for_filter(self, sheet: str | None) -> None:
+        if not sheet or sheet == getattr(self, "selected_sheet", None):
+            return
+        self._sheet_filter_programmatic_select = True
+        try:
+            self._select_tab(sheet)
+        finally:
+            self._sheet_filter_programmatic_select = False
+
+    def _sync_sheet_filter_selection(self) -> None:
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is None:
+            return
+        current = getattr(self, "selected_sheet", None)
+        status = self._sheet_filter_status(current) if current else None
+        # Do not jump while the current sheet is still unknown/loading. Once
+        # it is confirmed clean, select the first confirmed diff in stable
+        # workbook order. This consumes state only; it never queues a scan.
+        if (
+            model.only_diff
+            and current
+            and status is not None
+            and status.wait_like
+            and (not model.auto_select_pending or not model.confirmed_diff_names())
+        ):
+            return
+        target = model.preferred_sheet(current)
+        if target and target != current:
+            self._select_sheet_for_filter(target)
+
+    def _set_sheet_filter_mode(self, mode: str) -> None:
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is None:
+            return
+        model.set_mode(mode)
+        self._sync_sheet_filter_selection()
+        self.refresh_sheet_nav()
+
+    def _sheet_filter_nav_names(self) -> tuple[str, ...]:
+        model = getattr(self, "_sheet_filter_model", None)
+        return model.visible_names() if model is not None else tuple(self.display_sheets)
+
     def set_sheet_has_diff(self, sheet: str, has: bool, confirmed: bool = True):
         # Keep API: mark sheet diff state
         if sheet not in self.sheet_diff_state:
@@ -33576,6 +33659,15 @@ class SowMergeApp:
             # only downgrade when confirmed
             if confirmed:
                 self.sheet_diff_state[sheet] = 0
+        model = getattr(self, "_sheet_filter_model", None)
+        if model is not None:
+            model.publish(
+                sheet,
+                has,
+                count=int(getattr(self, "sheet_diff_total_counts", {}).get(sheet, 0)),
+                confirmed=confirmed,
+            )
+            self._sync_sheet_filter_selection()
 
     def _active_sheet_name(self) -> str | None:
         try:
@@ -34330,7 +34422,24 @@ class SowMergeApp:
 
         self.nav = ttk.Frame(self.bottom, style="MergeChrome.TFrame")
         self.nav.pack(side="left", fill="x", expand=True)
-        ttk.Label(self.nav, text="工作表（浅黄=预检，亮黄=确认）：", style="MergeChrome.TLabel").pack(side="left")
+        ttk.Label(self.nav, text="工作表：", style="MergeChrome.TLabel").pack(side="left")
+        self.sheet_filter_summary_var = tk.StringVar(value="有差异 0/0")
+        ttk.Label(self.nav, textvariable=self.sheet_filter_summary_var, style="MergeChrome.TLabel").pack(side="left", padx=(5, 6))
+        self.sheet_filter_diff_button = ttk.Button(
+            self.nav, text="仅有差异", width=8,
+            command=lambda: self._set_sheet_filter_mode("diff"),
+        )
+        self.sheet_filter_diff_button.pack(side="left", padx=(0, 3))
+        self.sheet_filter_all_button = ttk.Button(
+            self.nav, text="全部页签", width=8,
+            command=lambda: self._set_sheet_filter_mode("all"),
+        )
+        self.sheet_filter_all_button.pack(side="left", padx=(0, 5))
+        self.sheet_filter_empty_var = tk.StringVar(value="当前无已确认差异，可切换全部页签")
+        self.sheet_filter_empty_label = ttk.Label(
+            self.nav, textvariable=self.sheet_filter_empty_var, style="MergeChrome.TLabel"
+        )
+        ttk.Label(self.nav, text="浅黄=待确认，亮黄=确认：", style="MergeChrome.TLabel").pack(side="left")
         self.nav_canvas = tk.Canvas(self.nav, height=24, highlightthickness=0, bg=THEME.window_bg)
         self.nav_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.nav_scroll = ttk.Scrollbar(self.nav, orient="horizontal", command=self.nav_canvas.xview)
@@ -34398,6 +34507,9 @@ class SowMergeApp:
         ):
             if self._is_closing:
                 return
+            queued_view = self.sheet_views.get(sheet)
+            if queued_view is None or not getattr(queued_view, "_data_ready", False):
+                self.mark_sheet_loading(sheet)
             with self._compute_lock:
                 if exact_only_diff is None:
                     queued_view = self.sheet_views.get(sheet)
@@ -35734,6 +35846,7 @@ class SowMergeApp:
                     f"generation={generation}"
                 )
                 return
+            self.mark_sheet_failed(sheet, error_text)
             view = self.sheet_views.get(sheet)
             if view is None:
                 return
@@ -35907,6 +36020,11 @@ class SowMergeApp:
                             f"owner={owner_view.sheet} seq={owner_seq}"
                         )
                         return
+                filter_model = getattr(self, "_sheet_filter_model", None)
+                if filter_model is not None:
+                    filter_model.current_sheet = tab_text
+                    if not self._sheet_filter_programmatic_select and not self._sheet_filter_initializing:
+                        filter_model.auto_select_pending = False
                 self.selected_sheet = tab_text
                 self._cancel_priority_exact_for_hidden(tab_text)
                 self.refresh_sheet_nav()
@@ -36016,6 +36134,7 @@ class SowMergeApp:
 
         # Load the initially selected tab immediately so first-open state is ready.
         _on_tab_changed()
+        self._sheet_filter_initializing = False
 
         self.refresh_sheet_nav()
         self._refresh_command_widgets()
@@ -36305,11 +36424,18 @@ class SowMergeApp:
         # render, so for large sheets this avoids rebuilding the whole nav bar
         # on edits/scroll-driven refreshes where the sheet set is unchanged.
         try:
+            filter_model = getattr(self, "_sheet_filter_model", None)
+            visible_sheets = tuple(filter_model.visible_names()) if filter_model is not None else tuple(self.display_sheets)
             nav_sig = (
-                tuple(self.display_sheets),
-                tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in self.display_sheets),
-                tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in self.display_sheets),
-                tuple((s, int(getattr(self, "sheet_diff_counts", {}).get(s, 0))) for s in self.display_sheets),
+                visible_sheets,
+                getattr(filter_model, "mode", "diff") if filter_model is not None else "diff",
+                tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in visible_sheets),
+                tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in visible_sheets),
+                tuple((s, int(getattr(self, "sheet_diff_counts", {}).get(s, 0))) for s in visible_sheets),
+                tuple(
+                    (s, getattr(filter_model.status(s), "phase", ""), getattr(filter_model.status(s), "has_diff", None), getattr(filter_model.status(s), "count", 0))
+                    for s in visible_sheets
+                ) if filter_model is not None else (),
                 getattr(self, "selected_sheet", None),
                 getattr(
                     getattr(self, "_only_diff_progress_owner", (None,))[0]
@@ -36330,7 +36456,9 @@ class SowMergeApp:
         except Exception:
             nav_x = 0.0
         nav_buttons = getattr(self, "_nav_buttons", {})
-        desired = set(self.display_sheets)
+        filter_model = getattr(self, "_sheet_filter_model", None)
+        visible_sheets = tuple(filter_model.visible_names()) if filter_model is not None else tuple(self.display_sheets)
+        desired = set(visible_sheets)
         for old_sheet, old_button in list(nav_buttons.items()):
             if old_sheet not in desired:
                 try:
@@ -36387,13 +36515,22 @@ class SowMergeApp:
                     b.configure(font=self._nav_font)
             except Exception:
                 pass
-        for s in self.display_sheets:
+        for s in visible_sheets:
             meta = self.get_sheet_meta(s)
             kind = "missing" if meta.get("view_mode") == "missing_sheet" else "common"
             state = int(self.sheet_diff_state.get(s, 0))
-            count = int(getattr(self, "sheet_diff_counts", {}).get(s, 0))
+            status = filter_model.status(s) if filter_model is not None else None
+            count = int(
+                status.count
+                if status is not None and status.count
+                else getattr(self, "sheet_diff_counts", {}).get(s, 0)
+            )
             if kind == "missing":
                 label = f"⊘ {s} · 缺失"
+            elif status is not None and status.phase == "failed":
+                label = f"⚠ {s} · 计算失败"
+            elif status is not None and status.wait_like:
+                label = f"◌ {s} · 等待计算"
             elif state >= 2:
                 label = f"● {s} · 已确认" + (f" ({count})" if count else "")
             elif state == 1:
@@ -36401,6 +36538,24 @@ class SowMergeApp:
             else:
                 label = f"○ {s} · 无差异"
             add_btn(label, s, kind, state=state)
+
+        if filter_model is not None:
+            try:
+                self.sheet_filter_summary_var.set(filter_model.summary())
+                self.sheet_filter_diff_button.configure(
+                    state="normal",
+                    relief="sunken" if filter_model.mode == "diff" else "raised",
+                )
+                self.sheet_filter_all_button.configure(
+                    state="normal",
+                    relief="sunken" if filter_model.mode == "all" else "raised",
+                )
+                if filter_model.should_show_empty():
+                    self.sheet_filter_empty_label.pack(side="left", padx=(2, 5))
+                else:
+                    self.sheet_filter_empty_label.pack_forget()
+            except (AttributeError, tk.TclError):
+                pass
 
         self.nav_canvas.update_idletasks()
         self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
@@ -37339,7 +37494,7 @@ class SowMergeApp:
 
     def _refresh_current_view_after_val_reload(self):
         try:
-            self._refresh_sheet_catalog()
+            self._refresh_sheet_catalog(reset_filter=True)
             self._sheet_diff_confirmed.clear()
             for s in self.compare_sheets:
                 self.sheet_diff_state[s] = 0

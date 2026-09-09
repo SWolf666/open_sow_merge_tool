@@ -106,7 +106,7 @@ def main() -> None:
                 )
         if result["p95_ms"] > P95_LIMIT_MS:
             raise RuntimeError(f"merge profile p95 exceeds {P95_LIMIT_MS:.0f}ms")
-        output = Path("artifacts/performance/update94-merge.json")
+        output = Path("artifacts/performance/update95-merge.json")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False))

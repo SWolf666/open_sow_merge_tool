@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = '',
-  [string]$Version = '2026-09-04.update94'
+  [string]$Version = '2026-09-04.update95'
 )
 
 $ErrorActionPreference = 'Stop'

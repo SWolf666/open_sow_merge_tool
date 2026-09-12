@@ -94,6 +94,23 @@ def _wait_for_view(app: smt.SowMergeApp, sheet: str, *, timeout: float = 12.0):
     return app.sheet_views.get(sheet)
 
 
+def _wait_for_edit_ready(app: smt.SowMergeApp, *, timeout: float = 30.0) -> bool:
+    """Wait through the non-blocking editable-workbook preload gate.
+
+    The production UI deliberately keeps browsing/navigation responsive while
+    editable workbooks load.  Mutation assertions must therefore distinguish a
+    safe temporary rejection from a ready, executable edit path instead of
+    calling the synchronous fallback as part of the smoke test.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.root.update()
+        if app._edit_workbooks_ready():
+            return True
+        time.sleep(0.01)
+    return app._edit_workbooks_ready()
+
+
 def _assert_common_row_projection(items) -> None:
     assert any(item.kind is smt.DifferenceKind.DELETED and "共同删除" in item.summary for item in items), items
     assert any(item.kind is smt.DifferenceKind.ADDED and "共同新增" in item.summary for item in items), items
@@ -119,6 +136,16 @@ def main() -> None:
         _assert_common_row_projection(loaded_items)
         loaded_view = app.sheet_views.get("Data")
         assert loaded_view is not None and loaded_view._data_ready
+        assert getattr(app._wb_a_val, "read_only", False)
+        assert getattr(app._wb_b_val, "read_only", False)
+        assert app.ws_a_val("Data")["A1"].value == "row-1-new"
+        assert app.ws_b_val("Data")["A1"].value == "row-1-new"
+        if not app._edit_workbooks_ready():
+            # A click during preload is a non-blocking, safe rejection.  The
+            # next click after the gate is ready must be executable.
+            loaded_view.selected_pair_idx = 0
+            assert loaded_view._copy_selected_row("MINE2A") is False
+        assert _wait_for_edit_ready(app)
         # A normal three-way entry (without the legacy conflict-mode flag)
         # must expose an executable retain command that only marks the real
         # DifferenceItem and never changes any workbook bytes.
@@ -127,7 +154,8 @@ def main() -> None:
         loaded_view.selected_pair_idx = retain_pair
         loaded_view._last_selected_line = loaded_view.row_to_line.get(retain_pair, 1)
         loaded_view._selected_difference_item_id = retain_item.id
-        app._ensure_edit_loaded()
+        assert getattr(app._wb_a_val, "read_only", False)
+        assert getattr(app._wb_b_val, "read_only", False)
         retain_paths = (mine, theirs, app.file_a, app.file_b)
         retain_disk_before = _path_hashes(*retain_paths)
         retain_memory_before = (
@@ -137,6 +165,9 @@ def main() -> None:
             _workbook_fingerprint(app._wb_b_edit),
         )
         assert loaded_view._copy_selected_row("MINE2A")
+        assert not getattr(app._wb_a_val, "read_only", True)
+        assert not getattr(app._wb_b_val, "read_only", True)
+        assert hasattr(app.ws_a_val("Data"), "_cells")
         assert _path_hashes(*retain_paths) == retain_disk_before
         assert (
             _workbook_fingerprint(app._wb_a_val),
@@ -338,6 +369,9 @@ def main() -> None:
         cross_view._selected_difference_item_id = cross_item.id
         assert cross_view._format_direction_action("MINE2A") == "保留 Target Working 行"
         cross_paths = (mine, theirs, cross_app.file_a, cross_app.file_b)
+        if not cross_app._edit_workbooks_ready():
+            assert cross_view._copy_selected_row("MINE2A") is False
+        assert _wait_for_edit_ready(cross_app)
         cross_mine_before = _path_hashes(*cross_paths)
         assert cross_view._copy_selected_row("MINE2A")
         assert _path_hashes(*cross_paths) == cross_mine_before
@@ -486,6 +520,12 @@ def main() -> None:
             if item.column
         )
         two_view = two_way.sheet_views["Data"]
+        assert getattr(two_way._wb_a_val, "read_only", False)
+        assert getattr(two_way._wb_b_val, "read_only", False)
+        if not two_way._edit_workbooks_ready():
+            two_view.selected_pair_idx = 0
+            assert two_view._copy_selected_row("A2B") is False
+        assert _wait_for_edit_ready(two_way)
         two_view.selected_pair_idx = 0
         base_before = _digest(two_base)
         mine_before = _digest(two_mine)

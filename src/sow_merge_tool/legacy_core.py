@@ -14367,6 +14367,13 @@ class SheetView:
         self._refresh_interaction_gate()
         if getattr(self, "_lifecycle_state", "") == "READY":
             return True
+        if getattr(self, "_lifecycle_state", "") == "EDIT_LOADING":
+            # The first explicit mutation opts into the deferred editable
+            # preload.  Never wait on the Tk thread; the current click is
+            # rejected safely and the next click can proceed after READY.
+            request = getattr(self.app, "_request_edit_preload", None)
+            if callable(request):
+                request()
         if notify:
             show_notice = getattr(self.app, "show_nonblocking_notice", None)
             if callable(show_notice):
@@ -18798,6 +18805,7 @@ class SheetView:
         """
         target_side = str(target_side or "").upper()
         self.app._ensure_edit_loaded()
+        self.app._ensure_value_workbooks_regular()
         if target_side == "A":
             wb_edit = self.app._wb_a_edit
             wb_val = self.app._wb_a_val
@@ -26103,6 +26111,10 @@ class SheetView:
             return "break"
         if not self._guard_mutation_ready("单元格覆盖"):
             return "break"
+        # Upgrade the cached value workbooks only after the mutation gate has
+        # succeeded.  Browsing and background comparison remain read-only.
+        self.app._ensure_edit_loaded()
+        self.app._ensure_value_workbooks_regular()
         previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
@@ -27680,6 +27692,12 @@ class SheetView:
                 return False
         elif not self._guard_mutation_ready("行覆盖"):
             return False
+        # Value workbooks are opened read-only for fast startup.  Upgrade them
+        # before capturing any worksheet references because the upgrade swaps
+        # the workbook objects; otherwise local ReadOnlyWorksheet references
+        # would be closed when the editable gate runs below.
+        self.app._ensure_edit_loaded()
+        self.app._ensure_value_workbooks_regular()
         t0 = datetime.now()
         formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
         interactive_busy = not suppress_refresh
@@ -29468,6 +29486,15 @@ class SheetView:
 
     def refresh(self, row_only: int | None, rescan: bool, *, column_only: bool = False):
         _dlog(f"REFRESH sheet={self.sheet} row_only={row_only} rescan={rescan} only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()}")
+        if (
+            rescan
+            and not self._is_missing_sheet_view()
+            and not self.app._edit_workbooks_ready()
+        ):
+            # An explicit refresh/recalculation is an editing intent.  Start
+            # deferred editable loading in the background, but keep this
+            # refresh non-blocking so the Tk event loop remains responsive.
+            self.app._request_edit_preload()
         column_diff_seed_request = None
         if bool(column_only and rescan):
             column_diff_seed_request = getattr(self, "_pending_column_only_diff_seed", None)
@@ -30703,14 +30730,17 @@ class SowMergeApp:
         self._initial_sheet_ready_event = threading.Event()
         self._edit_preload_active_event = threading.Event()
         self._edit_loading_started = False
+        self._edit_preload_runner = None
         self._edit_fallback_lock = threading.Lock()
         self._wb_a_val = None
         self._wb_b_val = None
         self._wb_base_val = None
+        self._value_workbooks_regular = False
+        self._value_workbook_upgrade_lock = threading.Lock()
 
-        # Preload editable workbooks in background to make the first overwrite fast.
-        # Always run regardless of _FAST_OPEN_ENABLED: fast-open defers value loading
-        # but edit workbooks must still be ready before the user's first row override.
+        # Keep the editable loader available for the first explicit mutation,
+        # but defer starting it until that request so it cannot compete with
+        # the first visible Sheet's read-only comparison.
         def _preload_edit():
             loaded_ok = False
             try:
@@ -30736,7 +30766,12 @@ class SowMergeApp:
                 report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(self.file_a)}", 8)
                 t0 = datetime.now()
                 self._file_a_val_path = _prepare_val_path(self.file_a)
-                self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True, keep_links=False)
+                self._wb_a_val = load_workbook(
+                    self._file_a_val_path,
+                    data_only=True,
+                    read_only=True,
+                    keep_links=False,
+                )
                 _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 mine_working_path = self._mine_working_path()
@@ -30744,14 +30779,24 @@ class SowMergeApp:
                 report("正在打开 Excel 合并工具", f"加载 {side_label}：{os.path.basename(mine_working_path)}", 30)
                 t0 = datetime.now()
                 self._file_b_val_path = _prepare_val_path(mine_working_path)
-                self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True, keep_links=False)
+                self._wb_b_val = load_workbook(
+                    self._file_b_val_path,
+                    data_only=True,
+                    read_only=True,
+                    keep_links=False,
+                )
                 _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 if self.has_base:
                     report("正在打开 Excel 合并工具", f"加载 base：{os.path.basename(self.base_path)}", 52)
                     t0 = datetime.now()
                     self._file_base_val_path = _prepare_val_path(self.base_path)
-                    self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True, keep_links=False)
+                    self._wb_base_val = load_workbook(
+                        self._file_base_val_path,
+                        data_only=True,
+                        read_only=True,
+                        keep_links=False,
+                    )
                     _dlog(f"load wb_base_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                     report("正在准备三方合并", "创建 mine 安全快照...", 68)
@@ -30771,11 +30816,12 @@ class SowMergeApp:
                 self._refresh_sheet_catalog()
                 self._startup_trace.mark("sheet-catalog-ready")
                 if self._wb_a_edit is None or self._wb_b_edit is None or (self.has_base and self._wb_base_edit is None):
-                    self._edit_loading_started = True
-                    self._edit_preload_thread = self._start_background_thread(
-                        _preload_edit,
-                        name="sow-edit-preload",
-                    )
+                    # Do not compete with the first visible Sheet's XML
+                    # comparison.  The editable workbooks are started on the
+                    # first explicit mutation/save request instead; browsing
+                    # remains read-only and responsive until then.
+                    self._edit_preload_runner = _preload_edit
+                    self._edit_loading_started = False
                 else:
                     self._edit_loaded_event.set()
                 report(
@@ -31928,6 +31974,7 @@ class SowMergeApp:
 
     def _guard_save_readiness(self, action: str, target_side: str) -> bool:
         if not self._edit_workbooks_ready():
+            self._request_edit_preload()
             self.show_nonblocking_notice(
                 f"{action}暂不可用。可编辑工作簿仍在后台加载。",
                 duration_ms=6000,
@@ -31949,11 +31996,21 @@ class SowMergeApp:
         return True
 
     def _request_edit_preload(self):
-        """Release the existing preload worker without starting a second parser."""
-        try:
+        """Start the deferred editable-workbook load exactly once."""
+        if self._edit_workbooks_ready() or self._is_closing:
+            return
+        if getattr(self, "_edit_loading_started", False):
             self._initial_sheet_ready_event.set()
-        except Exception:
-            pass
+            return
+        runner = getattr(self, "_edit_preload_runner", None)
+        if not callable(runner):
+            return
+        self._edit_loading_started = True
+        self._initial_sheet_ready_event.set()
+        self._edit_preload_thread = self._start_background_thread(
+            runner,
+            name="sow-edit-preload",
+        )
 
     def _refresh_loaded_views_after_edit_ready(self):
         """Publish edit readiness without performing a Tk-thread rescan.
@@ -32053,6 +32110,60 @@ class SowMergeApp:
         finally:
             self._edit_preload_active_event.clear()
             _wbs_close(*loaded_here)
+
+    def _ensure_value_workbooks_regular(self) -> None:
+        """Upgrade read-only value workbooks only when a mutation needs them."""
+        if getattr(self, "_value_workbooks_regular", False):
+            return
+        with self._value_workbook_upgrade_lock:
+            if getattr(self, "_value_workbooks_regular", False):
+                return
+            old_values = (
+                self._wb_a_val,
+                self._wb_b_val,
+                self._wb_base_val,
+            )
+            loaded = []
+            try:
+                loaded.append(load_workbook(self._file_a_val_path, data_only=True, keep_links=False))
+                loaded.append(load_workbook(self._file_b_val_path, data_only=True, keep_links=False))
+                if self.has_base and getattr(self, "_file_base_val_path", None):
+                    loaded.append(load_workbook(self._file_base_val_path, data_only=True, keep_links=False))
+                new_base = loaded[2] if self.has_base and len(loaded) > 2 else None
+                if (
+                    len(loaded) != (3 if self.has_base else 2)
+                    or any(bool(getattr(workbook, "read_only", False)) for workbook in loaded)
+                ):
+                    raise RuntimeError("值工作簿升级后仍不可编辑。")
+                self._wb_a_val = loaded[0]
+                self._wb_b_val = loaded[1]
+                self._wb_base_val = new_base
+                self._value_workbooks_regular = True
+            except Exception:
+                _wbs_close(*loaded)
+                # The old read-only objects remain valid when the swap did not
+                # complete.  Do not leave a stale True marker after a partial
+                # reload or a failed open.
+                self._value_workbooks_regular = False
+                raise
+            finally:
+                if getattr(self, "_value_workbooks_regular", False):
+                    _wbs_close(*old_values)
+
+    def _value_workbooks_are_regular(self) -> bool:
+        """Return whether every active value workbook supports mutation.
+
+        ``openpyxl`` exposes ``read_only`` on both ``Workbook`` and
+        ``ReadOnlyWorkbook``.  Keep this check centralized because recalculation
+        and reload paths can replace only one side at a time.
+        """
+        workbooks = [self._wb_a_val, self._wb_b_val]
+        if self.has_base:
+            workbooks.append(self._wb_base_val)
+        return bool(
+            all(workbook is not None for workbook in workbooks)
+            and all(not bool(getattr(workbook, "read_only", False)) for workbook in workbooks)
+        )
 
     def _ensure_edit_loaded(self):
         if self._edit_workbooks_ready():
@@ -32450,6 +32561,7 @@ class SowMergeApp:
         if not self._guard_sheet_mutation(sheet, "整 Sheet 复制"):
             raise RuntimeError("当前 Sheet 尚未 READY，已阻止整 Sheet 复制。")
         self._ensure_edit_loaded()
+        self._ensure_value_workbooks_regular()
         source_side = str(source_side or "").upper()
         target_side = str(target_side or "").upper()
         src_val_wb, src_edit_wb = self._workbooks_for_side(source_side)
@@ -32497,6 +32609,7 @@ class SowMergeApp:
         if not self._guard_sheet_mutation(sheet, "整 Sheet 删除"):
             raise RuntimeError("当前 Sheet 尚未 READY，已阻止整 Sheet 删除。")
         self._ensure_edit_loaded()
+        self._ensure_value_workbooks_regular()
         target_side = str(target_side or "").upper()
         dst_val_wb, dst_edit_wb = self._workbooks_for_side(target_side)
         changed = _remove_sheet_if_exists(dst_edit_wb, sheet)
@@ -33589,14 +33702,16 @@ class SowMergeApp:
         if model is None:
             return
         model.mark_loading(sheet)
-        self.refresh_sheet_nav()
+        if not bool(getattr(self, "_defer_sheet_nav_refresh", False)):
+            self.refresh_sheet_nav()
 
     def mark_sheet_failed(self, sheet: str, error: str = "") -> None:
         model = getattr(self, "_sheet_filter_model", None)
         if model is None:
             return
         model.mark_failed(sheet, error)
-        self.refresh_sheet_nav()
+        if not bool(getattr(self, "_defer_sheet_nav_refresh", False)):
+            self.refresh_sheet_nav()
 
     def _select_sheet_for_filter(self, sheet: str | None) -> None:
         if not sheet or sheet == getattr(self, "selected_sheet", None):
@@ -36333,6 +36448,7 @@ class SowMergeApp:
             self._fast_tabmark_thread = None
 
         # Enqueue all sheets for background confirmation (slow compute)
+        self._defer_sheet_nav_refresh = True
         try:
             for s in self.compare_sheets:
                 _enqueue_sheet(s, front=False)
@@ -36342,6 +36458,9 @@ class SowMergeApp:
                 self._set_task_status("数据加载完成：没有需要逐行计算的同名 Sheet", active=False)
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
+        finally:
+            self._defer_sheet_nav_refresh = False
+            self.refresh_sheet_nav()
 
     def push_undo(self, action: dict):
         try:
@@ -36456,6 +36575,7 @@ class SowMergeApp:
         except Exception:
             nav_x = 0.0
         nav_buttons = getattr(self, "_nav_buttons", {})
+        nav_button_sigs = getattr(self, "_nav_button_sigs", {})
         filter_model = getattr(self, "_sheet_filter_model", None)
         visible_sheets = tuple(filter_model.visible_names()) if filter_model is not None else tuple(self.display_sheets)
         desired = set(visible_sheets)
@@ -36466,7 +36586,9 @@ class SowMergeApp:
                 except Exception:
                     pass
                 nav_buttons.pop(old_sheet, None)
+                nav_button_sigs.pop(old_sheet, None)
         self._nav_buttons = nav_buttons
+        self._nav_button_sigs = nav_button_sigs
 
         try:
             from tkinter import font as tkfont
@@ -36492,14 +36614,19 @@ class SowMergeApp:
             is_selected = (tab_text == getattr(self, "selected_sheet", None))
             if is_selected:
                 bg = "#D9D9D9"
+            progress_owner = getattr(self, "_only_diff_progress_owner", None)
+            progress_owner_sheet = getattr(progress_owner[0], "sheet", None) if progress_owner else None
+            button_sig = (label, int(state), bool(is_selected), progress_owner_sheet)
             b = nav_buttons.get(tab_text)
             if b is None or not b.winfo_exists():
                 b = tk.Button(self.nav_inner, command=lambda: self._select_tab(tab_text))
                 b.pack(side="left", padx=4)
                 nav_buttons[tab_text] = b
+                nav_button_sigs.pop(tab_text, None)
+            if nav_button_sigs.get(tab_text) == button_sig:
+                return
             b.configure(text=label, relief="sunken" if is_selected else "groove",
                         bd=2 if is_selected else 1, padx=8, pady=2, bg=bg)
-            progress_owner = getattr(self, "_only_diff_progress_owner", None)
             if progress_owner is not None and tab_text != getattr(
                 progress_owner[0],
                 "sheet",
@@ -36515,6 +36642,7 @@ class SowMergeApp:
                     b.configure(font=self._nav_font)
             except Exception:
                 pass
+            nav_button_sigs[tab_text] = button_sig
         for s in visible_sheets:
             meta = self.get_sheet_meta(s)
             kind = "missing" if meta.get("view_mode") == "missing_sheet" else "common"
@@ -37561,6 +37689,11 @@ class SowMergeApp:
             setattr(self, path_attr, wb_path)
             setattr(self, wb_attr, loaded_wb)
             _wbs_close(old_wb)
+
+        # Recalculation reloads normal (editable) value workbooks today, but
+        # keep the marker derived from the actual objects so a future partial
+        # reload cannot make the next mutation skip the read-only upgrade.
+        self._value_workbooks_regular = self._value_workbooks_are_regular()
 
         self._refresh_current_view_after_val_reload()
 

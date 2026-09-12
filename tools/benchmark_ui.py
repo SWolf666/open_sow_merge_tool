@@ -111,7 +111,7 @@ def main() -> None:
             }
         finally:
             ui_root.destroy()
-        output = Path("artifacts/performance/update95-ui.json")
+        output = Path("artifacts/performance/update96-ui.json")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(payload, ensure_ascii=False))

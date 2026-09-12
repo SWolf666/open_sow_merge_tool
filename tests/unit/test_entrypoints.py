@@ -7,7 +7,7 @@ from sow_merge_tool.path_selection import compare_selection_from_paths
 
 def test_public_entrypoint_and_version() -> None:
     assert public.APP_NAME == "sow_merge_tool"
-    assert public.APP_VERSION.endswith("update95")
+    assert public.APP_VERSION.endswith("update96")
     assert callable(public.run_entrypoint)
 
 

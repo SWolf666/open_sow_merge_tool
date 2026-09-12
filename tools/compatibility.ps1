@@ -42,7 +42,7 @@ try {
     $python = $runtime.Path
     & $python -m compileall -q (Join-Path $repo 'src')
     if ($LASTEXITCODE -ne 0) { throw "Python $($runtime.Label) compileall failed." }
-    & $python -c "import sow_merge_tool; assert sow_merge_tool.APP_VERSION.endswith('update95')"
+    & $python -c "import sow_merge_tool; assert sow_merge_tool.APP_VERSION.endswith('update96')"
     if ($LASTEXITCODE -ne 0) { throw "Python $($runtime.Label) import gate failed." }
     $help = & $python -m sow_merge_tool --help 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Python $($runtime.Label) --help gate failed: $help" }

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 
 from sow_merge_tool import legacy_core as smt
+from sow_merge_tool.vertical_layout import VerticalLayout
 
 
 def _write_book(path: Path, rows: list[str], *, extra_sheet: bool = False) -> None:
@@ -477,6 +478,30 @@ def main() -> None:
         loaded_view._keep_panes_equal()
         loaded_view._keep_panes_equal()
         assert "three" in app.settings.get("pane_sashes", {}).get(pane_key, {})
+
+        # Vertical module layout uses the same stable pane key and remains
+        # bounded when a grip is dragged beyond the window budget.
+        vertical_before = loaded_view._vertical_layout.lower_height
+
+        class _GripEvent:
+            def __init__(self, y_root):
+                self.y_root = y_root
+
+        loaded_view._on_main_vertical_grip_press(_GripEvent(500))
+        loaded_view._on_main_vertical_grip_motion(_GripEvent(100))
+        vertical_saved = app.settings.get("vertical_sashes", {}).get(pane_key, {})
+        assert loaded_view._vertical_layout.lower_height >= vertical_before
+        assert vertical_saved.get("lower_height") == loaded_view._vertical_layout.lower_height
+        loaded_view._on_hover_vertical_grip_press(_GripEvent(500))
+        loaded_view._on_hover_vertical_grip_motion(_GripEvent(100))
+        assert loaded_view._vertical_layout.hover_height >= 48
+        app._sheet_nav_height = 120
+        app._apply_sheet_nav_height()
+        assert app.settings.get("sheet_nav_height") == app._sheet_nav_height
+        app._reset_workspace_layout()
+        assert loaded_view._vertical_layout == VerticalLayout.default(
+            three_way=loaded_view._is_three_way_enabled()
+        ) or loaded_view._vertical_layout.lower_height >= 132
 
         # Completing a progress owner invalidates its generation and drops a
         # replaceable broker payload, so a late callback cannot reopen it.

@@ -231,6 +231,15 @@ def main() -> None:
         try:
             view = _wait_for_view(app)
             app.root.update_idletasks()
+            assert view._main_vertical_grip.winfo_ismapped(), "主窗格/C区纵向分隔条未显示"
+            assert view._hover_vertical_grip.winfo_ismapped(), "C区/悬停详情纵向分隔条未显示"
+            assert app._sheet_nav_grip.winfo_ismapped(), "Sheet导航纵向分隔条未显示"
+            menu_labels = [
+                app.more_menu_model.entrycget(index, "label")
+                for index in range(app.more_menu_model.index("end") + 1)
+                if app.more_menu_model.type(index) == "command"
+            ]
+            assert "恢复默认布局" in menu_labels, "更多菜单缺少恢复默认布局"
             assert app.sheet_filter_diff_button.winfo_ismapped()
             assert app.sheet_filter_all_button.winfo_ismapped()
             assert app.sheet_filter_summary_var.get().startswith("有差异")

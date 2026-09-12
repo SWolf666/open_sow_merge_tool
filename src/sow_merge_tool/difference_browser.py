@@ -145,6 +145,17 @@ class DifferenceBrowser:
         if self.on_resize:
             self.on_resize(self._height, self.collapsed)
 
+    def set_layout(self, *, height: int | None = None, collapsed: bool | None = None, notify: bool = True) -> None:
+        """Apply a bounded persisted layout without synthesizing a drag event."""
+        if height is not None:
+            self._height = max(90, min(460, int(height)))
+        if collapsed is not None:
+            self.collapsed = bool(collapsed)
+        self.frame.configure(height=34 if self.collapsed else self._height)
+        self.toggle_button.configure(text="展开" if self.collapsed else "收起")
+        if notify and self.on_resize:
+            self.on_resize(self._height, self.collapsed)
+
     def _resize(self, event):
         origin = getattr(self, "_resize_origin", (event.y_root, self._height))
         self._height = max(90, min(460, int(origin[1] + origin[0] - event.y_root)))

@@ -55,9 +55,8 @@ from .ui_foundation import (
 )
 from .difference_browser import DifferenceBrowser
 
-
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-12.update96"
+APP_VERSION = "2026-09-12.update97"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -13473,6 +13472,18 @@ class SheetView:
         # panel do not get squeezed to 1px on first layout.
         self.lower_area = ttk.Frame(self.frame)
         self.lower_area.pack(side="bottom", fill="x")
+        self.lower_area.pack_propagate(False)
+        self._main_vertical_grip = ttk.Separator(self.frame, orient="horizontal")
+        self._main_vertical_grip.pack(
+            side="bottom", fill="x", padx=8, before=self.lower_area
+        )
+        self._main_vertical_grip.configure(cursor="sb_v_double_arrow")
+        self._main_vertical_grip.bind(
+            "<Button-1>", self._on_main_vertical_grip_press
+        )
+        self._main_vertical_grip.bind(
+            "<B1-Motion>", self._on_main_vertical_grip_motion
+        )
 
         # Panes
         paned = ttk.PanedWindow(self.frame, orient="horizontal")
@@ -13498,6 +13509,22 @@ class SheetView:
                 getattr(self.app, "raw_theirs", None) or getattr(self.app, "file_b", ""),
             )).encode("utf-8", "ignore")
         ).hexdigest()[:16]
+        vertical_saved = (
+            getattr(self.app, "settings", {}).get("vertical_sashes", {})
+            if isinstance(getattr(self.app, "settings", {}), dict)
+            else {}
+        )
+        from .vertical_layout import VerticalLayout
+
+        self._vertical_layout = VerticalLayout.from_mapping(
+            vertical_saved.get(self._pane_settings_key)
+            if isinstance(vertical_saved, dict)
+            else None,
+            three_way=self._is_three_way_enabled(),
+        )
+        self.frame.bind(
+            "<Configure>", self._on_vertical_frame_configure, add="+"
+        )
         def _keep_panes_equal(_evt=None):
             """Restore the user's pane proportions once, then remember drags."""
             try:
@@ -13985,6 +14012,7 @@ class SheetView:
         # C区: compact cursor compare block + cell-aligned view
         self.c_area = ttk.Notebook(self.lower_area, style="CompactPanel.TNotebook")
         self.c_area.pack(fill="x", padx=8, pady=(0, 2))
+        self.c_area.pack_propagate(False)
 
         # ---- C1: compact row compare (2 lines in 2-way, 3 lines in 3-way) ----
         c_text_frame = ttk.Frame(self.c_area)
@@ -14102,6 +14130,17 @@ class SheetView:
             self.hover_cmp_host.pack_propagate(False)
         except Exception:
             pass
+        self._hover_vertical_grip = ttk.Separator(self.lower_area, orient="horizontal")
+        self._hover_vertical_grip.pack(
+            side="bottom", fill="x", padx=8, before=self.hover_cmp_host
+        )
+        self._hover_vertical_grip.configure(cursor="sb_v_double_arrow")
+        self._hover_vertical_grip.bind(
+            "<Button-1>", self._on_hover_vertical_grip_press
+        )
+        self._hover_vertical_grip.bind(
+            "<B1-Motion>", self._on_hover_vertical_grip_motion
+        )
         # One heading line carries both the panel purpose and the current
         # Sheet/cell identity. A second LabelFrame title only consumed height.
         hover_cmp_frame = ttk.Frame(self.hover_cmp_host)
@@ -14158,6 +14197,7 @@ class SheetView:
         # self.refresh(row_only=None, rescan=True)
         # self._update_cursor_lines()
         # Initial panel state (must run after C区 widgets are created)
+        self._apply_vertical_layout(persist=False)
         self._toggle_three_way_view(init_only=True)
         self._refresh_interaction_gate()
 
@@ -14174,6 +14214,104 @@ class SheetView:
             return bool(self._is_three_way_enabled() and self.three_way_var.get())
         except Exception:
             return False
+
+    def _vertical_layout_available_height(self) -> int:
+        try:
+            height = int(self.frame.winfo_height())
+            if height > 1:
+                return height
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
+        try:
+            return int(self.root.winfo_height())
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            return 620
+
+    def _persist_vertical_layout(self) -> None:
+        settings = getattr(self.app, "settings", None)
+        if not isinstance(settings, dict):
+            return
+        mapping = self._vertical_layout.to_mapping()
+        # Sheet navigation is app-global; keep it out of the per-comparison
+        # pane record so restoring one comparison cannot overwrite another.
+        mapping.pop("nav_height", None)
+        settings.setdefault("vertical_sashes", {})[self._pane_settings_key] = mapping
+        schedule = getattr(self.app, "_schedule_layout_settings_save", None)
+        if callable(schedule):
+            schedule()
+
+    def _apply_vertical_layout(self, *, persist: bool = True) -> None:
+        from .vertical_layout import GRIP_HEIGHT
+
+        self._vertical_layout = self._vertical_layout.normalized(
+            self._vertical_layout_available_height(),
+            three_way=self._is_three_way_enabled(),
+        )
+        try:
+            self.lower_area.configure(height=self._vertical_layout.lower_height)
+            c_height = max(
+                64,
+                self._vertical_layout.lower_height
+                - self._vertical_layout.hover_height
+                - GRIP_HEIGHT,
+            )
+            self.c_area.configure(height=c_height)
+            self.hover_cmp_host.configure(height=self._vertical_layout.hover_height)
+        except (AttributeError, tk.TclError):
+            return
+        if persist:
+            self._persist_vertical_layout()
+
+    def _on_vertical_frame_configure(self, _event=None):
+        self._apply_vertical_layout(persist=False)
+
+    def _on_main_vertical_grip_press(self, event):
+        self._vertical_drag_origin = (
+            int(event.y_root),
+            int(self._vertical_layout.lower_height),
+            "lower",
+        )
+
+    def _on_main_vertical_grip_motion(self, event):
+        from .vertical_layout import VerticalLayout
+
+        origin_y, origin_value, _kind = getattr(
+            self, "_vertical_drag_origin", (int(event.y_root), self._vertical_layout.lower_height, "lower")
+        )
+        self._vertical_layout = VerticalLayout(
+            lower_height=origin_value + origin_y - int(event.y_root),
+            hover_height=self._vertical_layout.hover_height,
+            nav_height=self._vertical_layout.nav_height,
+        )
+        self._apply_vertical_layout()
+
+    def _on_hover_vertical_grip_press(self, event):
+        self._vertical_drag_origin = (
+            int(event.y_root),
+            int(self._vertical_layout.hover_height),
+            "hover",
+        )
+
+    def _on_hover_vertical_grip_motion(self, event):
+        from .vertical_layout import VerticalLayout
+
+        origin_y, origin_value, _kind = getattr(
+            self, "_vertical_drag_origin", (int(event.y_root), self._vertical_layout.hover_height, "hover")
+        )
+        self._vertical_layout = VerticalLayout(
+            lower_height=self._vertical_layout.lower_height,
+            hover_height=origin_value + origin_y - int(event.y_root),
+            nav_height=self._vertical_layout.nav_height,
+        )
+        self._apply_vertical_layout()
+
+    def reset_vertical_layout(self) -> None:
+        from .vertical_layout import VerticalLayout
+
+        self._vertical_layout = VerticalLayout.default(
+            three_way=self._is_three_way_enabled()
+        )
+        self._apply_vertical_layout()
 
     def _hover_compare_reserved_height(self, enabled: bool | None = None) -> int:
         enabled = self._is_three_way_enabled() if enabled is None else bool(enabled)
@@ -14960,6 +15098,7 @@ class SheetView:
             self._sync_hover_compare_reserved_height(model_enabled)
         except Exception:
             pass
+        self._apply_vertical_layout(persist=False)
         if not init_only:
             try:
                 self._last_three_way_value = int(self.three_way_var.get())
@@ -33458,6 +33597,86 @@ class SowMergeApp:
             return
         settings["difference_browser_height"] = max(90, min(460, int(height)))
         settings["difference_browser_collapsed"] = bool(collapsed)
+        self._schedule_layout_settings_save()
+
+    def _schedule_layout_settings_save(self) -> None:
+        """Persist layout changes after a short drag debounce."""
+        root = getattr(self, "root", None)
+        if root is None or getattr(self, "_is_closing", False):
+            return
+        pending = getattr(self, "_layout_save_after_id", None)
+        if pending:
+            try:
+                root.after_cancel(pending)
+            except (tk.TclError, RuntimeError):
+                pass
+        try:
+            self._layout_save_after_id = root.after(500, self._write_layout_settings)
+        except (tk.TclError, RuntimeError):
+            self._layout_save_after_id = None
+
+    def _write_layout_settings(self) -> None:
+        self._layout_save_after_id = None
+        try:
+            os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+            with open(_SETTINGS_PATH, "w", encoding="utf-8") as stream:
+                json.dump(getattr(self, "settings", {}) or {}, stream, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError) as exc:
+            _dlog(f"layout settings save failed: {exc}")
+
+    def _apply_sheet_nav_height(self, *, persist: bool = True) -> None:
+        from .vertical_layout import VerticalLayout
+
+        layout = VerticalLayout(
+            nav_height=int(getattr(self, "_sheet_nav_height", 34)),
+        ).normalized(
+            max(360, int(self.root.winfo_height() or 620)),
+        )
+        self._sheet_nav_height = layout.nav_height
+        try:
+            self.bottom.configure(height=self._sheet_nav_height)
+            self.nav_canvas.configure(height=max(18, self._sheet_nav_height - 10))
+        except (AttributeError, tk.TclError):
+            return
+        if persist:
+            self.settings["sheet_nav_height"] = self._sheet_nav_height
+            self._schedule_layout_settings_save()
+
+    def _on_sheet_nav_grip_press(self, event) -> None:
+        self._sheet_nav_drag_origin = (
+            int(event.y_root),
+            int(getattr(self, "_sheet_nav_height", 34)),
+        )
+
+    def _on_sheet_nav_grip_motion(self, event) -> None:
+        origin_y, origin_height = getattr(
+            self,
+            "_sheet_nav_drag_origin",
+            (int(event.y_root), int(getattr(self, "_sheet_nav_height", 34))),
+        )
+        self._sheet_nav_height = origin_height + origin_y - int(event.y_root)
+        self._apply_sheet_nav_height()
+
+    def _reset_workspace_layout(self) -> None:
+        self.settings.pop("vertical_sashes", None)
+        self.settings["sheet_nav_height"] = 34
+        for view in getattr(self, "sheet_views", {}).values():
+            if view is not None:
+                view.reset_vertical_layout()
+        self._sheet_nav_height = 34
+        self._apply_sheet_nav_height(persist=False)
+        diff_browser = getattr(self, "_diff_browser", None)
+        if diff_browser is not None:
+            diff_browser.set_layout(
+                height=150,
+                collapsed=False,
+                notify=False,
+            )
+        self._schedule_layout_settings_save()
+
+    def _on_global_reset_layout(self, _event=None):
+        self._reset_workspace_layout()
+        return "break"
 
     def _persist_difference_browser_preferences(self) -> None:
         if self._diff_browser is None:
@@ -34462,6 +34681,8 @@ class SowMergeApp:
         self.more_menu_model.add_command(label="导出诊断包", command=self.export_diagnostic_bundle)
         self.more_menu_model.add_command(label="复制反馈信息", command=self.copy_feedback_info)
         self.more_menu_model.add_command(label="检查更新", command=self._do_svn_update)
+        self.more_menu_model.add_separator()
+        self.more_menu_model.add_command(label="恢复默认布局", command=self._reset_workspace_layout)
         self.more_menu.configure(menu=self.more_menu_model)
         # The group widgets are laid out by one responsive grid.  Keeping the
         # overflow menu in the same measured item list makes it reachable at
@@ -34528,12 +34749,19 @@ class SowMergeApp:
         self.nb = ttk.Notebook(self.root, style="SheetHost.TNotebook")
         try:
             self.root.bind("<F4>", self._on_global_f4)
+            self.root.bind("<Control-Shift-Key-0>", self._on_global_reset_layout)
         except Exception:
             pass
 
         # Bottom bar: sheet nav (only)
         self.bottom = ttk.Frame(self.root, style="MergeChrome.TFrame")
         self.bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+        self.bottom.pack_propagate(False)
+        self._sheet_nav_grip = ttk.Separator(self.bottom, orient="horizontal")
+        self._sheet_nav_grip.pack(side="top", fill="x")
+        self._sheet_nav_grip.configure(cursor="sb_v_double_arrow")
+        self._sheet_nav_grip.bind("<Button-1>", self._on_sheet_nav_grip_press)
+        self._sheet_nav_grip.bind("<B1-Motion>", self._on_sheet_nav_grip_motion)
 
         self.nav = ttk.Frame(self.bottom, style="MergeChrome.TFrame")
         self.nav.pack(side="left", fill="x", expand=True)
@@ -34563,6 +34791,12 @@ class SowMergeApp:
         self.nav_inner = ttk.Frame(self.nav_canvas, style="MergeChrome.TFrame")
         self.nav_canvas.create_window((0, 0), window=self.nav_inner, anchor="nw")
         self.nav_inner.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
+        from .vertical_layout import VerticalLayout
+
+        self._sheet_nav_height = VerticalLayout.from_mapping(
+            {"nav_height": getattr(self, "settings", {}).get("sheet_nav_height", 34)},
+        ).nav_height
+        self._apply_sheet_nav_height(persist=False)
         # Commercial-compare-inspired cache-backed difference browser.  It is a dock,
         # not a second navigation system: Sheet strip remains the sole host
         # navigator and selecting a row only locates the corresponding cell.
